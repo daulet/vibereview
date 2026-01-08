@@ -732,75 +732,507 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn test_extract_agent_id_from_text() {
-        // Test agentId extraction from text
-        let text = "Some result text\nagentId: a0c970e (for resuming)";
-        assert_eq!(extract_agent_id(text), Some("a0c970e".to_string()));
+    // ==================== UTF-8 SAFETY TESTS ====================
+    // Issue: "byte index 500 is not a char boundary" panic when truncating
+    // multi-byte UTF-8 characters
 
-        let text2 = "agentId: abc123";
-        assert_eq!(extract_agent_id(text2), Some("abc123".to_string()));
+    #[test]
+    fn test_truncate_display_ascii() {
+        let text = "Hello, World!";
+        assert_eq!(truncate_display(text, 5), "Hello...");
+        assert_eq!(truncate_display(text, 100), "Hello, World!");
     }
 
     #[test]
-    fn test_extract_result_string_from_tool_use_result() {
-        // Test extracting from toolUseResult object (has agentId at top level, content as array)
-        let tool_use_result = json!({
-            "status": "completed",
-            "agentId": "a0c970e",
-            "content": [
-                {"type": "text", "text": "First part of result"},
-                {"type": "text", "text": "agentId: a0c970e (for resuming)"}
-            ]
-        });
+    fn test_truncate_display_multibyte_utf8() {
+        // Japanese text - each character is 3 bytes
+        let text = "こんにちは世界"; // "Hello World" in Japanese
+        // Should not panic and should truncate by characters, not bytes
+        let truncated = truncate_display(text, 3);
+        assert_eq!(truncated, "こんに...");
 
-        let result = extract_result_string(Some(&tool_use_result), "tool123", None);
-        assert!(result.is_some());
-        let result_str = result.unwrap();
-        assert!(result_str.contains("First part of result"));
-        assert!(result_str.contains("agentId: a0c970e"));
+        // Emoji - 4 bytes each
+        let emoji_text = "🎉🎊🎁🎄🎅";
+        let truncated_emoji = truncate_display(emoji_text, 2);
+        assert_eq!(truncated_emoji, "🎉🎊...");
+    }
+
+    #[test]
+    fn test_truncate_display_mixed_utf8() {
+        // Mixed ASCII and multi-byte
+        let text = "Hello 世界! 🌍";
+        let truncated = truncate_display(text, 8);
+        assert_eq!(truncated, "Hello 世界...");
+    }
+
+    // ==================== AGENT ID EXTRACTION TESTS ====================
+    // Issue: agentId was including extra text like "(for resuming)"
+
+    #[test]
+    fn test_extract_agent_id_simple() {
+        assert_eq!(extract_agent_id("agentId: abc123"), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_agent_id_with_parenthetical() {
+        // Real format from Claude Code sessions
+        let text = "agentId: a0c970e (for resuming to continue this agent's work if needed)";
+        assert_eq!(extract_agent_id(text), Some("a0c970e".to_string()));
+    }
+
+    #[test]
+    fn test_extract_agent_id_multiline() {
+        let text = "## Exploration Summary\n\nSome content here...\n\nagentId: a3dc895 (for resuming)";
+        assert_eq!(extract_agent_id(text), Some("a3dc895".to_string()));
+    }
+
+    #[test]
+    fn test_extract_agent_id_not_found() {
+        assert_eq!(extract_agent_id("No agent ID here"), None);
+        assert_eq!(extract_agent_id(""), None);
+    }
+
+    // ==================== TOOL USE RESULT EXTRACTION TESTS ====================
+    // Issue: toolUseResult.content is an array of text blocks, not a string
+
+    #[test]
+    fn test_extract_result_string_from_string() {
+        let result = json!("Simple string result");
+        assert_eq!(
+            extract_result_string(Some(&result), "tool1", None),
+            Some("Simple string result".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_result_string_from_content_string() {
+        let result = json!({"content": "Content as string"});
+        assert_eq!(
+            extract_result_string(Some(&result), "tool1", None),
+            Some("Content as string".to_string())
+        );
     }
 
     #[test]
     fn test_extract_result_string_from_content_array() {
-        // Test extracting from content array directly
-        let content = json!([
-            {"type": "text", "text": "Result text here"},
-            {"type": "text", "text": "More text"}
+        // Real format from tool_result content
+        let result = json!([
+            {"type": "text", "text": "First part"},
+            {"type": "text", "text": "Second part"}
         ]);
-
-        let result = extract_result_string(Some(&content), "tool123", None);
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("Result text here"));
+        let extracted = extract_result_string(Some(&result), "tool1", None);
+        assert!(extracted.is_some());
+        let text = extracted.unwrap();
+        assert!(text.contains("First part"));
+        assert!(text.contains("Second part"));
     }
 
     #[test]
-    fn test_task_tool_gets_agent_id() {
-        // Test that Task tool properly extracts agentId from toolUseResult
-        let tool_use_result = json!({
+    fn test_extract_result_string_from_tool_use_result_object() {
+        // Real format from toolUseResult at entry level (Task tool)
+        let result = json!({
             "status": "completed",
-            "agentId": "test123",
+            "prompt": "Do something",
+            "agentId": "a0c970e",
             "content": [
-                {"type": "text", "text": "Task completed successfully"}
+                {"type": "text", "text": "## Exploration Summary\n\nBased on my investigation..."},
+                {"type": "text", "text": "agentId: a0c970e (for resuming)"}
+            ],
+            "totalDurationMs": 35224,
+            "totalTokens": 18407
+        });
+        let extracted = extract_result_string(Some(&result), "tool1", None);
+        assert!(extracted.is_some());
+        let text = extracted.unwrap();
+        assert!(text.contains("Exploration Summary"));
+        assert!(text.contains("agentId: a0c970e"));
+    }
+
+    #[test]
+    fn test_extract_result_string_from_bash_result() {
+        // Bash tool result format
+        let result = json!({
+            "stdout": "file1.rs\nfile2.rs\nfile3.rs",
+            "stderr": "",
+            "interrupted": false,
+            "isImage": false
+        });
+        assert_eq!(
+            extract_result_string(Some(&result), "tool1", None),
+            Some("file1.rs\nfile2.rs\nfile3.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_result_string_from_read_result() {
+        // Read tool result format
+        let result = json!({
+            "type": "text",
+            "file": {
+                "filePath": "/path/to/file.rs",
+                "content": "fn main() {\n    println!(\"Hello\");\n}",
+                "numLines": 3,
+                "startLine": 1,
+                "totalLines": 3
+            }
+        });
+        assert_eq!(
+            extract_result_string(Some(&result), "tool1", None),
+            Some("fn main() {\n    println!(\"Hello\");\n}".to_string())
+        );
+    }
+
+    // ==================== TOOL TYPE PARSING TESTS ====================
+    // Tests for various tool types with realistic inputs
+
+    #[test]
+    fn test_parse_read_tool() {
+        let input = json!({"file_path": "/Users/test/project/Cargo.toml"});
+        let result = json!({
+            "type": "text",
+            "file": {
+                "filePath": "/Users/test/project/Cargo.toml",
+                "content": "[package]\nname = \"test\"",
+                "numLines": 2
+            }
+        });
+
+        let (tool_type, input_display, _output_display) =
+            parse_tool_type("Read", &input, Some(&result), "tool1", None, None);
+
+        assert!(matches!(tool_type, ToolType::FileRead { path, content }
+            if path == "/Users/test/project/Cargo.toml" && content.is_some()));
+        assert_eq!(input_display, "/Users/test/project/Cargo.toml");
+    }
+
+    #[test]
+    fn test_parse_edit_tool() {
+        // Real Edit tool input format
+        let input = json!({
+            "file_path": "/Users/test/Cargo.toml",
+            "old_string": "[dependencies]\nratatui = \"0.29\"",
+            "new_string": "[dependencies]\nratatui = \"0.29\"\nserde = \"1.0\""
+        });
+
+        let (tool_type, _input_display, _output_display) =
+            parse_tool_type("Edit", &input, None, "tool1", None, None);
+
+        if let ToolType::FileEdit { path, old_content, new_content, diff } = tool_type {
+            assert_eq!(path, "/Users/test/Cargo.toml");
+            assert!(old_content.is_some());
+            assert!(new_content.is_some());
+            assert!(diff.is_some());
+            // Diff should show the added line
+            assert!(diff.unwrap().contains("+serde"));
+        } else {
+            panic!("Expected FileEdit tool type");
+        }
+    }
+
+    #[test]
+    fn test_parse_bash_tool() {
+        let input = json!({
+            "command": "cargo build",
+            "description": "Build the project"
+        });
+        let result = json!({
+            "stdout": "   Compiling test v0.1.0\n    Finished dev",
+            "stderr": "",
+            "interrupted": false
+        });
+
+        let (tool_type, input_display, output_display) =
+            parse_tool_type("Bash", &input, Some(&result), "tool1", None, None);
+
+        if let ToolType::Command { command, stdout, .. } = tool_type {
+            assert_eq!(command, "cargo build");
+            assert!(stdout.unwrap().contains("Compiling"));
+        } else {
+            panic!("Expected Command tool type");
+        }
+        assert!(input_display.contains("Build the project"));
+        assert!(input_display.contains("$ cargo build"));
+        assert!(output_display.contains("Compiling"));
+    }
+
+    #[test]
+    fn test_parse_task_tool_with_agent_id() {
+        // Real Task tool result format with agentId
+        let input = json!({
+            "subagent_type": "Explore",
+            "prompt": "Explore the codebase",
+            "description": "Explore codebase structure"
+        });
+        let result = json!({
+            "status": "completed",
+            "prompt": "Explore the codebase",
+            "agentId": "a3dc895",
+            "content": [
+                {"type": "text", "text": "## Exploration Summary\n\nFound 10 files."},
+                {"type": "text", "text": "agentId: a3dc895 (for resuming)"}
+            ],
+            "totalDurationMs": 35224
+        });
+
+        let (tool_type, _input_display, _output_display) =
+            parse_tool_type("Task", &input, Some(&result), "tool1", None, None);
+
+        if let ToolType::Task { description, prompt, subagent_type, result: result_str, .. } = tool_type {
+            assert_eq!(description, "Explore codebase structure");
+            assert_eq!(prompt, "Explore the codebase");
+            assert_eq!(subagent_type, Some("Explore".to_string()));
+            assert!(result_str.is_some());
+            assert!(result_str.unwrap().contains("Exploration Summary"));
+        } else {
+            panic!("Expected Task tool type");
+        }
+    }
+
+    #[test]
+    fn test_parse_todo_write_tool() {
+        let input = json!({
+            "todos": [
+                {"content": "Fix bug", "status": "completed", "activeForm": "Fixing bug"},
+                {"content": "Add tests", "status": "in_progress", "activeForm": "Adding tests"},
+                {"content": "Deploy", "status": "pending", "activeForm": "Deploying"}
             ]
         });
 
-        let input = json!({
-            "description": "Test task",
-            "prompt": "Do something",
-            "subagent_type": "Explore"
-        });
+        let (tool_type, input_display, _) =
+            parse_tool_type("TodoWrite", &input, None, "tool1", None, None);
 
-        let (_tool_type, _, _) = parse_tool_type("Task", &input, Some(&tool_use_result), "tool1", None, None);
-
-        // Verify we can extract from the toolUseResult
-        assert!(tool_use_result.get("agentId").is_some());
-        assert_eq!(tool_use_result.get("agentId").unwrap().as_str(), Some("test123"));
+        if let ToolType::TodoUpdate { todos } = tool_type {
+            assert_eq!(todos.len(), 3);
+            assert_eq!(todos[0].content, "Fix bug");
+            assert_eq!(todos[0].status, "completed");
+        } else {
+            panic!("Expected TodoUpdate tool type");
+        }
+        assert!(input_display.contains("[completed] Fix bug"));
+        assert!(input_display.contains("[in_progress] Add tests"));
     }
 
     #[test]
-    fn test_parse_real_session() {
-        // Test parsing the real promptui session and check for Task tools with subagent turns
+    fn test_parse_glob_tool() {
+        let input = json!({"pattern": "**/*.rs", "path": "/project"});
+        let result = json!([
+            {"type": "text", "text": "src/main.rs\nsrc/lib.rs\nsrc/utils.rs"}
+        ]);
+
+        let (tool_type, input_display, _) =
+            parse_tool_type("Glob", &input, Some(&result), "tool1", None, None);
+
+        if let ToolType::Search { pattern, results } = tool_type {
+            assert_eq!(pattern, "**/*.rs");
+            assert_eq!(results.len(), 3);
+            assert!(results.contains(&"src/main.rs".to_string()));
+        } else {
+            panic!("Expected Search tool type");
+        }
+        assert_eq!(input_display, "**/*.rs");
+    }
+
+    // ==================== TURN BUILDING TESTS ====================
+    // Tests for building turns from session entries
+
+    #[test]
+    fn test_build_turns_user_assistant_pair() {
+        let entries = vec![
+            json!({
+                "type": "user",
+                "uuid": "user-1",
+                "message": {
+                    "role": "user",
+                    "content": "Hello, help me with Rust"
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-4-5-20251101",
+                    "content": [
+                        {"type": "text", "text": "I'd be happy to help with Rust!"}
+                    ]
+                }
+            })
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_prompt, "Hello, help me with Rust");
+        assert_eq!(turns[0].response, "I'd be happy to help with Rust!");
+        assert_eq!(turns[0].model, Some("claude-opus-4-5-20251101".to_string()));
+    }
+
+    #[test]
+    fn test_build_turns_with_thinking() {
+        let entries = vec![
+            json!({
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "Explain closures"}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Let me think about how to explain closures clearly..."},
+                        {"type": "text", "text": "Closures are anonymous functions that capture their environment."}
+                    ]
+                }
+            })
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].thinking.is_some());
+        assert!(turns[0].thinking.as_ref().unwrap().contains("think about"));
+        assert!(turns[0].response.contains("Closures are"));
+    }
+
+    #[test]
+    fn test_build_turns_with_tool_use_and_result() {
+        let entries = vec![
+            json!({
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "Read my Cargo.toml"}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Let me read that file."},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_123",
+                            "name": "Read",
+                            "input": {"file_path": "/project/Cargo.toml"}
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "user",
+                "uuid": "user-2",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": "[package]\nname = \"myproject\""
+                        }
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-2",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Your project is named 'myproject'."}
+                    ]
+                }
+            })
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_invocations.len(), 1);
+
+        let tool = &turns[0].tool_invocations[0];
+        assert_eq!(tool.id, "toolu_123");
+        assert!(matches!(&tool.tool_type, ToolType::FileRead { path, .. } if path == "/project/Cargo.toml"));
+    }
+
+    #[test]
+    fn test_build_turns_multiple_turns() {
+        let entries = vec![
+            json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "First question"}}),
+            json!({"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "First answer"}]}}),
+            json!({"type": "user", "uuid": "u2", "message": {"role": "user", "content": "Second question"}}),
+            json!({"type": "assistant", "uuid": "a2", "message": {"role": "assistant", "content": [{"type": "text", "text": "Second answer"}]}}),
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user_prompt, "First question");
+        assert_eq!(turns[1].user_prompt, "Second question");
+    }
+
+    // ==================== ENTRY-LEVEL toolUseResult TESTS ====================
+    // Issue: agentId is in entry.toolUseResult, not in message.content[].content
+
+    #[test]
+    fn test_process_tool_results_uses_entry_tool_use_result() {
+        // This tests that process_tool_results prefers entry-level toolUseResult
+        // which contains the agentId for Task tools
+        let entry = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_task_123",
+                        "content": [
+                            {"type": "text", "text": "Result text"},
+                            {"type": "text", "text": "agentId: abc123 (for resuming)"}
+                        ]
+                    }
+                ]
+            },
+            "toolUseResult": {
+                "status": "completed",
+                "agentId": "abc123",
+                "content": [
+                    {"type": "text", "text": "Result from toolUseResult"},
+                    {"type": "text", "text": "agentId: abc123 (for resuming)"}
+                ]
+            }
+        });
+
+        let tool_use = json!({
+            "type": "tool_use",
+            "id": "toolu_task_123",
+            "name": "Task",
+            "input": {
+                "description": "Test task",
+                "prompt": "Do something",
+                "subagent_type": "Explore"
+            }
+        });
+
+        let mut pending = HashMap::new();
+        pending.insert("toolu_task_123".to_string(), tool_use);
+        let mut invocations = Vec::new();
+
+        process_tool_results(&entry, &mut pending, &mut invocations, None, None);
+
+        assert_eq!(invocations.len(), 1);
+        // The result should come from toolUseResult which has the agentId
+        if let ToolType::Task { result, .. } = &invocations[0].tool_type {
+            assert!(result.is_some());
+            // Should contain content from toolUseResult
+            assert!(result.as_ref().unwrap().contains("Result from toolUseResult"));
+        } else {
+            panic!("Expected Task tool type");
+        }
+    }
+
+    // ==================== REAL SESSION INTEGRATION TEST ====================
+
+    #[test]
+    fn test_parse_real_session_with_subagents() {
+        // Test parsing real session and verify Task tools load subagent turns
         let session_path = dirs::home_dir()
             .map(|h| h.join(".claude/projects/-Users-dzhanguzin-dev-promptui/063cd168-91d2-41bd-b7ba-5d2dee7fc7ab.jsonl"));
 
@@ -808,22 +1240,124 @@ mod tests {
             if path.exists() {
                 let session = parse_session(&path).expect("Should parse session");
 
-                // Find Task tools and check if any have subagent turns
-                let mut found_task_with_turns = false;
+                // Verify session metadata
+                assert!(!session.id.is_empty());
+                assert!(matches!(session.source, SessionSource::ClaudeCode { .. }));
+
+                // Count tools by type
+                let mut task_count = 0;
+                let mut task_with_subagent_count = 0;
+                let mut read_count = 0;
+                let mut edit_count = 0;
+                let mut _bash_count = 0;
+
                 for turn in &session.turns {
                     for tool in &turn.tool_invocations {
-                        if let ToolType::Task { subagent_turns, .. } = &tool.tool_type {
-                            if !subagent_turns.is_empty() {
-                                found_task_with_turns = true;
-                                println!("Found Task with {} subagent turns", subagent_turns.len());
+                        match &tool.tool_type {
+                            ToolType::Task { subagent_turns, .. } => {
+                                task_count += 1;
+                                if !subagent_turns.is_empty() {
+                                    task_with_subagent_count += 1;
+                                }
                             }
+                            ToolType::FileRead { .. } => read_count += 1,
+                            ToolType::FileEdit { .. } => edit_count += 1,
+                            ToolType::Command { .. } => _bash_count += 1,
+                            _ => {}
                         }
                     }
                 }
 
-                // This test will show if we're properly loading subagent turns
-                println!("Found Task with subagent turns: {}", found_task_with_turns);
+                // Based on the session we explored, we expect:
+                // - 2 Task tools
+                // - Multiple Read, Edit, Bash tools
+                assert!(task_count >= 2, "Expected at least 2 Task tools, got {}", task_count);
+                assert!(task_with_subagent_count >= 1,
+                    "Expected at least 1 Task with subagent turns, got {}", task_with_subagent_count);
+                assert!(read_count > 0, "Expected Read tools");
+                assert!(edit_count > 0, "Expected Edit tools");
             }
         }
+    }
+
+    #[test]
+    fn test_list_sessions_excludes_agent_files() {
+        let project_path = dirs::home_dir()
+            .map(|h| h.join(".claude/projects/-Users-dzhanguzin-dev-promptui"));
+
+        if let Some(path) = project_path {
+            if path.exists() {
+                let sessions = list_sessions(&path);
+
+                // Verify no agent-* files are included
+                for session in &sessions {
+                    assert!(
+                        !session.name.starts_with("agent-"),
+                        "Session list should not include agent files: {}",
+                        session.name
+                    );
+                }
+            }
+        }
+    }
+
+    // ==================== EDGE CASES ====================
+
+    #[test]
+    fn test_empty_entries() {
+        let entries: Vec<Value> = vec![];
+        let turns = build_turns(&entries, None, None);
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn test_user_message_without_assistant() {
+        let entries = vec![
+            json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Hello"}}),
+        ];
+        let turns = build_turns(&entries, None, None);
+        // Should create a turn even without assistant response
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user_prompt, "Hello");
+        assert!(turns[0].response.is_empty());
+    }
+
+    #[test]
+    fn test_user_message_with_array_content() {
+        // User message with content as array (includes input_text type)
+        let entries = vec![
+            json!({
+                "type": "user",
+                "uuid": "u1",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "First part"},
+                        {"type": "text", "text": "Second part"}
+                    ]
+                }
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Response"}]}
+            }),
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].user_prompt.contains("First part"));
+    }
+
+    #[test]
+    fn test_skip_non_message_entries() {
+        let entries = vec![
+            json!({"type": "file-history-snapshot", "messageId": "123"}),
+            json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "Hello"}}),
+            json!({"type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "Hi"}]}}),
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 1);
     }
 }
