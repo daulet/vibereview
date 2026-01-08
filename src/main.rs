@@ -1,3 +1,6 @@
+mod claude;
+mod models;
+
 use std::io;
 
 use color_eyre::Result;
@@ -15,40 +18,19 @@ use ratatui::{
     Frame, Terminal,
 };
 
-// =============================================================================
-// Data Models
-// =============================================================================
-
-#[derive(Debug, Clone)]
-pub struct ChangeNode {
-    pub id: String,
-    pub title: String,
-    pub prompt: String,
-    pub thinking: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
-    pub diff: Option<String>,
-    pub children: Vec<ChangeNode>,
-    pub depth: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCall {
-    pub tool_name: String,
-    pub input: String,
-    pub output: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct FlattenedNode {
-    pub node: ChangeNode,
-    pub depth: usize,
-    pub is_last_child: bool,
-    pub parent_is_last: Vec<bool>,
-}
+use claude::{list_projects, list_sessions, parse_session, ProjectInfo, SessionInfo};
+use models::{Session, ToolType, Turn};
 
 // =============================================================================
 // App State
 // =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    ProjectBrowser,
+    SessionBrowser,
+    SessionViewer,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailTab {
@@ -88,115 +70,198 @@ impl DetailTab {
 }
 
 pub struct App {
-    pub tree: Vec<ChangeNode>,
-    pub flattened: Vec<FlattenedNode>,
-    pub list_state: ListState,
+    pub view: View,
+    pub projects: Vec<ProjectInfo>,
+    pub sessions: Vec<SessionInfo>,
+    pub session: Option<Session>,
+    pub selected_project: Option<ProjectInfo>,
+    pub project_list_state: ListState,
+    pub session_list_state: ListState,
+    pub turn_list_state: ListState,
     pub active_tab: DetailTab,
     pub scroll_offset: u16,
+    pub tool_scroll_offset: usize,
     pub should_quit: bool,
+    pub error_message: Option<String>,
 }
 
 impl App {
-    pub fn new(tree: Vec<ChangeNode>) -> Self {
-        let flattened = flatten_tree(&tree);
-        let mut list_state = ListState::default();
-        if !flattened.is_empty() {
-            list_state.select(Some(0));
+    pub fn new() -> Self {
+        let projects = list_projects();
+        let mut project_list_state = ListState::default();
+        if !projects.is_empty() {
+            project_list_state.select(Some(0));
         }
+
         Self {
-            tree,
-            flattened,
-            list_state,
+            view: View::ProjectBrowser,
+            projects,
+            sessions: Vec::new(),
+            session: None,
+            selected_project: None,
+            project_list_state,
+            session_list_state: ListState::default(),
+            turn_list_state: ListState::default(),
             active_tab: DetailTab::Prompt,
             scroll_offset: 0,
+            tool_scroll_offset: 0,
             should_quit: false,
+            error_message: None,
         }
     }
 
-    pub fn selected_node(&self) -> Option<&FlattenedNode> {
-        self.list_state.selected().and_then(|i| self.flattened.get(i))
+    pub fn selected_turn(&self) -> Option<&Turn> {
+        self.session.as_ref().and_then(|s| {
+            self.turn_list_state.selected().and_then(|i| s.turns.get(i))
+        })
     }
 
-    pub fn select_next(&mut self) {
-        if self.flattened.is_empty() {
+    fn select_next_in_list(state: &mut ListState, len: usize) {
+        if len == 0 {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i >= self.flattened.len() - 1 {
-                    0
-                } else {
-                    i + 1
-                }
-            }
+        let i = match state.selected() {
+            Some(i) => if i >= len - 1 { 0 } else { i + 1 },
             None => 0,
         };
-        self.list_state.select(Some(i));
-        self.scroll_offset = 0;
+        state.select(Some(i));
     }
 
-    pub fn select_prev(&mut self) {
-        if self.flattened.is_empty() {
+    fn select_prev_in_list(state: &mut ListState, len: usize) {
+        if len == 0 {
             return;
         }
-        let i = match self.list_state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.flattened.len() - 1
-                } else {
-                    i - 1
-                }
-            }
+        let i = match state.selected() {
+            Some(i) => if i == 0 { len - 1 } else { i - 1 },
             None => 0,
         };
-        self.list_state.select(Some(i));
-        self.scroll_offset = 0;
+        state.select(Some(i));
     }
 
-    pub fn next_tab(&mut self) {
-        self.active_tab = self.active_tab.next();
-        self.scroll_offset = 0;
+    pub fn handle_key(&mut self, key: KeyCode) {
+        // Clear error on any key
+        self.error_message = None;
+
+        match self.view {
+            View::ProjectBrowser => self.handle_project_browser_key(key),
+            View::SessionBrowser => self.handle_session_browser_key(key),
+            View::SessionViewer => self.handle_session_viewer_key(key),
+        }
     }
 
-    pub fn prev_tab(&mut self) {
-        self.active_tab = self.active_tab.prev();
-        self.scroll_offset = 0;
+    fn handle_project_browser_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Up => Self::select_prev_in_list(&mut self.project_list_state, self.projects.len()),
+            KeyCode::Down => Self::select_next_in_list(&mut self.project_list_state, self.projects.len()),
+            KeyCode::Enter => {
+                if let Some(i) = self.project_list_state.selected() {
+                    if let Some(project) = self.projects.get(i) {
+                        self.selected_project = Some(project.clone());
+                        self.sessions = list_sessions(&project.path);
+                        self.session_list_state = ListState::default();
+                        if !self.sessions.is_empty() {
+                            self.session_list_state.select(Some(0));
+                        }
+                        self.view = View::SessionBrowser;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
-    pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(1);
+    fn handle_session_browser_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.view = View::ProjectBrowser;
+            }
+            KeyCode::Up => Self::select_prev_in_list(&mut self.session_list_state, self.sessions.len()),
+            KeyCode::Down => Self::select_next_in_list(&mut self.session_list_state, self.sessions.len()),
+            KeyCode::Enter => {
+                if let Some(i) = self.session_list_state.selected() {
+                    if let Some(session_info) = self.sessions.get(i) {
+                        match parse_session(&session_info.path) {
+                            Ok(session) => {
+                                self.session = Some(session);
+                                self.turn_list_state = ListState::default();
+                                if let Some(s) = &self.session {
+                                    if !s.turns.is_empty() {
+                                        self.turn_list_state.select(Some(0));
+                                    }
+                                }
+                                self.active_tab = DetailTab::Prompt;
+                                self.scroll_offset = 0;
+                                self.tool_scroll_offset = 0;
+                                self.view = View::SessionViewer;
+                            }
+                            Err(e) => {
+                                self.error_message = Some(format!("Failed to parse session: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
-    pub fn scroll_up(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-    }
-}
-
-fn flatten_tree(tree: &[ChangeNode]) -> Vec<FlattenedNode> {
-    let mut result = Vec::new();
-    flatten_recursive(tree, 0, &mut vec![], &mut result);
-    result
-}
-
-fn flatten_recursive(
-    nodes: &[ChangeNode],
-    depth: usize,
-    parent_is_last: &mut Vec<bool>,
-    result: &mut Vec<FlattenedNode>,
-) {
-    for (i, node) in nodes.iter().enumerate() {
-        let is_last = i == nodes.len() - 1;
-        result.push(FlattenedNode {
-            node: node.clone(),
-            depth,
-            is_last_child: is_last,
-            parent_is_last: parent_is_last.clone(),
-        });
-
-        if !node.children.is_empty() {
-            parent_is_last.push(is_last);
-            flatten_recursive(&node.children, depth + 1, parent_is_last, result);
-            parent_is_last.pop();
+    fn handle_session_viewer_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.view = View::SessionBrowser;
+                self.session = None;
+            }
+            KeyCode::Up => {
+                if let Some(s) = &self.session {
+                    Self::select_prev_in_list(&mut self.turn_list_state, s.turns.len());
+                    self.scroll_offset = 0;
+                    self.tool_scroll_offset = 0;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = &self.session {
+                    Self::select_next_in_list(&mut self.turn_list_state, s.turns.len());
+                    self.scroll_offset = 0;
+                    self.tool_scroll_offset = 0;
+                }
+            }
+            KeyCode::Left => {
+                self.active_tab = self.active_tab.prev();
+                self.scroll_offset = 0;
+                self.tool_scroll_offset = 0;
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.active_tab = self.active_tab.next();
+                self.scroll_offset = 0;
+                self.tool_scroll_offset = 0;
+            }
+            KeyCode::Char('j') => {
+                if self.active_tab == DetailTab::ToolCalls {
+                    if let Some(turn) = self.selected_turn() {
+                        if self.tool_scroll_offset < turn.tool_invocations.len().saturating_sub(1) {
+                            self.tool_scroll_offset += 1;
+                        }
+                    }
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_add(3);
+                }
+            }
+            KeyCode::Char('k') => {
+                if self.active_tab == DetailTab::ToolCalls {
+                    self.tool_scroll_offset = self.tool_scroll_offset.saturating_sub(1);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                }
+            }
+            KeyCode::Char('g') => {
+                self.scroll_offset = 0;
+                self.tool_scroll_offset = 0;
+            }
+            KeyCode::Char('G') => {
+                self.scroll_offset = u16::MAX;
+            }
+            _ => {}
         }
     }
 }
@@ -206,50 +271,41 @@ fn flatten_recursive(
 // =============================================================================
 
 fn ui(frame: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(frame.area());
+    match app.view {
+        View::ProjectBrowser => render_project_browser(frame, app),
+        View::SessionBrowser => render_session_browser(frame, app),
+        View::SessionViewer => render_session_viewer(frame, app),
+    }
 
-    render_tree(frame, app, chunks[0]);
-    render_detail_panel(frame, app, chunks[1]);
+    // Render error message if any
+    if let Some(error) = &app.error_message {
+        let area = frame.area();
+        let error_area = Rect {
+            x: area.x + 2,
+            y: area.y + area.height - 2,
+            width: area.width.saturating_sub(4),
+            height: 1,
+        };
+        let error_msg = Paragraph::new(error.as_str())
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+        frame.render_widget(error_msg, error_area);
+    }
 }
 
-fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_project_browser(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
     let items: Vec<ListItem> = app
-        .flattened
+        .projects
         .iter()
-        .map(|flat_node| {
-            let mut prefix = String::new();
-
-            for (i, &is_last) in flat_node.parent_is_last.iter().enumerate() {
-                if i < flat_node.depth {
-                    if is_last {
-                        prefix.push_str("    ");
-                    } else {
-                        prefix.push_str("│   ");
-                    }
-                }
-            }
-
-            if flat_node.depth > 0 {
-                if flat_node.is_last_child {
-                    prefix.push_str("└── ");
-                } else {
-                    prefix.push_str("├── ");
-                }
-            }
-
-            let content = format!("{}{}", prefix, flat_node.node.title);
-            ListItem::new(content)
-        })
+        .map(|p| ListItem::new(p.decoded_path.clone()))
         .collect();
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Changes Tree "),
+                .title(" Select Project (Enter to open, q to quit) "),
         )
         .highlight_style(
             Style::default()
@@ -258,15 +314,116 @@ fn render_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    frame.render_stateful_widget(list, area, &mut app.project_list_state);
+}
+
+fn render_session_browser(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
+    let title = if let Some(p) = &app.selected_project {
+        format!(" Sessions in {} (Esc to go back) ", p.decoded_path)
+    } else {
+        " Sessions ".to_string()
+    };
+
+    let items: Vec<ListItem> = app
+        .sessions
+        .iter()
+        .map(|s| {
+            let modified = s.modified
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| {
+                    let secs = d.as_secs();
+                    let hours_ago = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|n| n.as_secs())
+                        .unwrap_or(secs) - secs) / 3600;
+                    if hours_ago < 24 {
+                        format!("{}h ago", hours_ago)
+                    } else {
+                        format!("{}d ago", hours_ago / 24)
+                    }
+                })
+                .unwrap_or_default();
+
+            let display = if s.name.starts_with("agent-") {
+                format!("{} (agent) {}", &s.name[..20.min(s.name.len())], modified)
+            } else {
+                format!("{} {}", &s.name[..20.min(s.name.len())], modified)
+            };
+            ListItem::new(display)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut app.session_list_state);
+}
+
+fn render_session_viewer(frame: &mut Frame, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(frame.area());
+
+    render_turn_list(frame, app, chunks[0]);
+    render_detail_panel(frame, app, chunks[1]);
+}
+
+fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(session) = &app.session else {
+        return;
+    };
+
+    let items: Vec<ListItem> = session
+        .turns
+        .iter()
+        .enumerate()
+        .map(|(i, turn)| {
+            let prompt_preview: String = turn.user_prompt
+                .chars()
+                .take(40)
+                .collect::<String>()
+                .replace('\n', " ");
+
+            let tool_count = turn.tool_invocations.len();
+            let tool_info = if tool_count > 0 {
+                format!(" [{}]", tool_count)
+            } else {
+                String::new()
+            };
+
+            ListItem::new(format!("{}: {}{}", i + 1, prompt_preview, tool_info))
+        })
+        .collect();
+
+    let title = format!(" Turns ({}) - Esc to go back ", session.turns.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut app.turn_list_state);
 }
 
 fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
+    // Tab bar
     let tab_titles = vec!["Prompt", "Thinking", "Tool Calls", "Diff"];
     let tabs = Tabs::new(tab_titles)
         .block(Block::default().borders(Borders::ALL).title(" Details "))
@@ -279,68 +436,56 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_widget(tabs, chunks[0]);
 
+    // Content
     let content_block = Block::default().borders(Borders::ALL);
 
-    if let Some(flat_node) = app.selected_node() {
-        let node = &flat_node.node;
+    if let Some(turn) = app.selected_turn() {
         let content: Text = match app.active_tab {
-            DetailTab::Prompt => Text::from(node.prompt.clone()),
+            DetailTab::Prompt => {
+                let mut lines = vec![
+                    Line::styled("User Prompt:", Style::default().fg(Color::Cyan).bold()),
+                    Line::from(""),
+                ];
+                for line in turn.user_prompt.lines() {
+                    lines.push(Line::from(line));
+                }
+
+                if !turn.response.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled("─".repeat(40), Style::default().fg(Color::DarkGray)));
+                    lines.push(Line::from(""));
+                    lines.push(Line::styled("Response:", Style::default().fg(Color::Green).bold()));
+                    lines.push(Line::from(""));
+                    for line in turn.response.lines() {
+                        lines.push(Line::from(line));
+                    }
+                }
+
+                Text::from(lines)
+            }
             DetailTab::Thinking => {
-                if let Some(thinking) = &node.thinking {
-                    Text::from(thinking.clone())
+                if let Some(thinking) = &turn.thinking {
+                    let mut lines = vec![
+                        Line::styled("Model Thinking:", Style::default().fg(Color::Magenta).bold()),
+                        Line::from(""),
+                    ];
+                    for line in thinking.lines() {
+                        lines.push(Line::from(line));
+                    }
+                    Text::from(lines)
                 } else {
-                    Text::styled("No thinking available", Style::default().fg(Color::DarkGray))
+                    Text::styled("No thinking available for this turn", Style::default().fg(Color::DarkGray))
                 }
             }
             DetailTab::ToolCalls => {
-                if node.tool_calls.is_empty() {
-                    Text::styled("No tool calls", Style::default().fg(Color::DarkGray))
+                if turn.tool_invocations.is_empty() {
+                    Text::styled("No tool calls in this turn", Style::default().fg(Color::DarkGray))
                 } else {
-                    let mut lines: Vec<Line> = Vec::new();
-                    for (i, tc) in node.tool_calls.iter().enumerate() {
-                        if i > 0 {
-                            lines.push(Line::from(""));
-                            lines.push(Line::from("─".repeat(40)));
-                            lines.push(Line::from(""));
-                        }
-                        lines.push(Line::from(vec![
-                            Span::styled("Tool: ", Style::default().fg(Color::Cyan)),
-                            Span::styled(&tc.tool_name, Style::default().bold()),
-                        ]));
-                        lines.push(Line::from(""));
-                        lines.push(Line::styled("Input:", Style::default().fg(Color::Green)));
-                        for line in tc.input.lines() {
-                            lines.push(Line::from(format!("  {}", line)));
-                        }
-                        lines.push(Line::from(""));
-                        lines.push(Line::styled("Output:", Style::default().fg(Color::Yellow)));
-                        for line in tc.output.lines() {
-                            lines.push(Line::from(format!("  {}", line)));
-                        }
-                    }
-                    Text::from(lines)
+                    render_tool_calls(turn, app.tool_scroll_offset)
                 }
             }
             DetailTab::Diff => {
-                if let Some(diff) = &node.diff {
-                    let lines: Vec<Line> = diff
-                        .lines()
-                        .map(|line| {
-                            if line.starts_with('+') && !line.starts_with("+++") {
-                                Line::styled(line, Style::default().fg(Color::Green))
-                            } else if line.starts_with('-') && !line.starts_with("---") {
-                                Line::styled(line, Style::default().fg(Color::Red))
-                            } else if line.starts_with("@@") {
-                                Line::styled(line, Style::default().fg(Color::Cyan))
-                            } else {
-                                Line::from(line)
-                            }
-                        })
-                        .collect();
-                    Text::from(lines)
-                } else {
-                    Text::styled("No diff available", Style::default().fg(Color::DarkGray))
-                }
+                render_diffs(turn)
             }
         };
 
@@ -350,214 +495,122 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
             .scroll((app.scroll_offset, 0));
         frame.render_widget(paragraph, chunks[1]);
     } else {
-        let paragraph = Paragraph::new("Select a change to view details")
+        let paragraph = Paragraph::new("Select a turn to view details")
             .block(content_block)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(paragraph, chunks[1]);
     }
 
-    // Render help at the bottom
-    let help_text = " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | q: Quit ";
-    let help_area = Rect {
-        x: area.x,
-        y: area.y + area.height - 1,
-        width: area.width,
-        height: 1,
-    };
+    // Help line
+    let help_text = " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | g/G: Top/Bottom | Esc: Back ";
     let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, help_area);
+    frame.render_widget(help, chunks[2]);
+}
+
+fn render_tool_calls(turn: &Turn, scroll_offset: usize) -> Text<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::styled(
+        format!("Tool Calls ({} total) - j/k to scroll between tools", turn.tool_invocations.len()),
+        Style::default().fg(Color::Cyan).bold(),
+    ));
+    lines.push(Line::from(""));
+
+    for (i, tool) in turn.tool_invocations.iter().enumerate() {
+        let is_selected = i == scroll_offset;
+        let marker = if is_selected { "▶ " } else { "  " };
+
+        // Tool header
+        let header_style = if is_selected {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::DarkGray)),
+            Span::styled(tool.tool_type.name().to_string(), header_style),
+        ]));
+
+        if is_selected {
+            lines.push(Line::from(""));
+
+            // Input
+            lines.push(Line::styled("  Input:".to_string(), Style::default().fg(Color::Green)));
+            for line in tool.input_display.lines() {
+                lines.push(Line::from(format!("    {}", line)));
+            }
+
+            lines.push(Line::from(""));
+
+            // Output
+            lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
+            for line in tool.output_display.lines().take(20) {
+                lines.push(Line::from(format!("    {}", line)));
+            }
+            if tool.output_display.lines().count() > 20 {
+                lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
+            }
+
+            lines.push(Line::from(""));
+        }
+    }
+
+    Text::from(lines)
+}
+
+fn render_diffs(turn: &Turn) -> Text<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut has_diff = false;
+
+    for tool in &turn.tool_invocations {
+        if let Some(diff) = tool.tool_type.diff() {
+            has_diff = true;
+
+            // File header
+            let path = match &tool.tool_type {
+                ToolType::FileEdit { path, .. } => path.clone(),
+                ToolType::FileWrite { path, .. } => path.clone(),
+                _ => "unknown".to_string(),
+            };
+
+            lines.push(Line::styled(
+                format!("─── {} ───", path),
+                Style::default().fg(Color::Cyan).bold(),
+            ));
+            lines.push(Line::from(""));
+
+            // Diff content with syntax highlighting
+            for line in diff.lines() {
+                let line_owned = line.to_string();
+                let styled_line = if line.starts_with('+') && !line.starts_with("+++") {
+                    Line::styled(line_owned, Style::default().fg(Color::Green))
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    Line::styled(line_owned, Style::default().fg(Color::Red))
+                } else if line.starts_with("@@") {
+                    Line::styled(line_owned, Style::default().fg(Color::Cyan))
+                } else if line.starts_with("---") || line.starts_with("+++") {
+                    Line::styled(line_owned, Style::default().fg(Color::White).bold())
+                } else {
+                    Line::from(line_owned)
+                };
+                lines.push(styled_line);
+            }
+
+            lines.push(Line::from(""));
+        }
+    }
+
+    if !has_diff {
+        return Text::styled("No diffs available for this turn", Style::default().fg(Color::DarkGray));
+    }
+
+    Text::from(lines)
 }
 
 // =============================================================================
-// Sample Data
-// =============================================================================
-
-fn create_sample_tree() -> Vec<ChangeNode> {
-    vec![
-        ChangeNode {
-            id: "1".to_string(),
-            title: "Initial project setup".to_string(),
-            prompt: "Create a new Rust project with ratatui for building a terminal UI application that displays a tree of changes.".to_string(),
-            thinking: Some("The user wants to create a TUI application. I should:\n1. Initialize a new Cargo project\n2. Add ratatui and crossterm dependencies\n3. Set up the basic terminal handling\n4. Create a simple render loop".to_string()),
-            tool_calls: vec![
-                ToolCall {
-                    tool_name: "Bash".to_string(),
-                    input: "cargo init promptui".to_string(),
-                    output: "Created binary (application) `promptui` package".to_string(),
-                },
-                ToolCall {
-                    tool_name: "Edit".to_string(),
-                    input: "Add dependencies to Cargo.toml".to_string(),
-                    output: "Added ratatui = \"0.29\"\nAdded crossterm = \"0.28\"".to_string(),
-                },
-            ],
-            diff: Some(r#"diff --git a/Cargo.toml b/Cargo.toml
-new file mode 100644
---- /dev/null
-+++ b/Cargo.toml
-@@ -0,0 +1,9 @@
-+[package]
-+name = "promptui"
-+version = "0.1.0"
-+edition = "2021"
-+
-+[dependencies]
-+ratatui = "0.29"
-+crossterm = "0.28"
-"#.to_string()),
-            children: vec![
-                ChangeNode {
-                    id: "1.1".to_string(),
-                    title: "Add data models".to_string(),
-                    prompt: "Define the data structures for representing a tree of changes with prompts, thinking, and tool calls.".to_string(),
-                    thinking: Some("I need to create structs that can:\n- Represent a tree structure (nodes with children)\n- Store LLM interaction data (prompt, thinking, tool calls)\n- Store diffs for code changes\n\nI'll create ChangeNode and ToolCall structs.".to_string()),
-                    tool_calls: vec![
-                        ToolCall {
-                            tool_name: "Edit".to_string(),
-                            input: "Add ChangeNode and ToolCall structs to main.rs".to_string(),
-                            output: "Structs added successfully".to_string(),
-                        },
-                    ],
-                    diff: Some(r#"diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1,0 +1,20 @@
-+#[derive(Debug, Clone)]
-+pub struct ChangeNode {
-+    pub id: String,
-+    pub title: String,
-+    pub prompt: String,
-+    pub thinking: Option<String>,
-+    pub tool_calls: Vec<ToolCall>,
-+    pub diff: Option<String>,
-+    pub children: Vec<ChangeNode>,
-+}
-+
-+#[derive(Debug, Clone)]
-+pub struct ToolCall {
-+    pub tool_name: String,
-+    pub input: String,
-+    pub output: String,
-+}
-"#.to_string()),
-                    children: vec![],
-                    depth: 1,
-                },
-                ChangeNode {
-                    id: "1.2".to_string(),
-                    title: "Implement tree view".to_string(),
-                    prompt: "Create the left panel that displays the changes as a tree with proper indentation and branch characters.".to_string(),
-                    thinking: Some("For the tree view, I need to:\n1. Flatten the tree for display in a list\n2. Calculate proper indentation with tree characters (├── └── │)\n3. Track parent state to draw connecting lines correctly\n4. Handle selection highlighting".to_string()),
-                    tool_calls: vec![
-                        ToolCall {
-                            tool_name: "Edit".to_string(),
-                            input: "Add flatten_tree function and render_tree".to_string(),
-                            output: "Tree rendering implemented".to_string(),
-                        },
-                    ],
-                    diff: None,
-                    children: vec![
-                        ChangeNode {
-                            id: "1.2.1".to_string(),
-                            title: "Add tree navigation".to_string(),
-                            prompt: "Implement keyboard navigation for moving up and down in the tree.".to_string(),
-                            thinking: Some("Navigation should:\n- Support arrow keys (up/down)\n- Wrap around at boundaries\n- Reset scroll position when selection changes".to_string()),
-                            tool_calls: vec![],
-                            diff: None,
-                            children: vec![],
-                            depth: 2,
-                        },
-                    ],
-                    depth: 1,
-                },
-            ],
-            depth: 0,
-        },
-        ChangeNode {
-            id: "2".to_string(),
-            title: "Add detail panel".to_string(),
-            prompt: "Create the right panel with tabs for viewing prompt, thinking, tool calls, and diff.".to_string(),
-            thinking: Some("The detail panel needs:\n1. A tab bar at the top for switching views\n2. Content area that changes based on selected tab\n3. Syntax highlighting for diffs (green for additions, red for deletions)\n4. Scrolling support for long content".to_string()),
-            tool_calls: vec![
-                ToolCall {
-                    tool_name: "Edit".to_string(),
-                    input: "Add DetailTab enum and render_detail_panel function".to_string(),
-                    output: "Detail panel with tabs implemented".to_string(),
-                },
-            ],
-            diff: Some(r#"diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -50,0 +51,15 @@
-+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-+pub enum DetailTab {
-+    Prompt,
-+    Thinking,
-+    ToolCalls,
-+    Diff,
-+}
-"#.to_string()),
-            children: vec![
-                ChangeNode {
-                    id: "2.1".to_string(),
-                    title: "Style diff output".to_string(),
-                    prompt: "Add syntax highlighting to the diff view with colors for additions and deletions.".to_string(),
-                    thinking: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            tool_name: "Edit".to_string(),
-                            input: "Add color styling for diff lines".to_string(),
-                            output: "Green for +, Red for -, Cyan for @@".to_string(),
-                        },
-                    ],
-                    diff: Some(r#"diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -180,6 +180,14 @@
--                    Text::from(diff.clone())
-+                    let lines: Vec<Line> = diff
-+                        .lines()
-+                        .map(|line| {
-+                            if line.starts_with('+') {
-+                                Line::styled(line, Style::default().fg(Color::Green))
-+                            } else if line.starts_with('-') {
-+                                Line::styled(line, Style::default().fg(Color::Red))
-+                            } else {
-+                                Line::from(line)
-+                            }
-+                        })
-+                        .collect();
-+                    Text::from(lines)
-"#.to_string()),
-                    children: vec![],
-                    depth: 1,
-                },
-            ],
-            depth: 0,
-        },
-        ChangeNode {
-            id: "3".to_string(),
-            title: "Bug fix: scroll reset".to_string(),
-            prompt: "Fix the bug where scroll position wasn't resetting when changing selection or tabs.".to_string(),
-            thinking: Some("The scroll_offset needs to be reset to 0 whenever:\n1. The user selects a different node in the tree\n2. The user switches tabs\n\nI'll add scroll_offset = 0 to select_next, select_prev, next_tab, and prev_tab methods.".to_string()),
-            tool_calls: vec![],
-            diff: Some(r#"diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -95,6 +95,7 @@
-         };
-         self.list_state.select(Some(i));
-+        self.scroll_offset = 0;
-     }
-"#.to_string()),
-            children: vec![],
-            depth: 0,
-        },
-    ]
-}
-
-// =============================================================================
-// Main & Event Loop
+// Main
 // =============================================================================
 
 fn main() -> Result<()> {
@@ -568,9 +621,8 @@ fn main() -> Result<()> {
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    // Create app with sample data
-    let tree = create_sample_tree();
-    let mut app = App::new(tree);
+    // Create app
+    let mut app = App::new();
 
     // Main loop
     while !app.should_quit {
@@ -579,17 +631,7 @@ fn main() -> Result<()> {
         if event::poll(std::time::Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                        KeyCode::Up => app.select_prev(),
-                        KeyCode::Down => app.select_next(),
-                        KeyCode::Left => app.prev_tab(),
-                        KeyCode::Right => app.next_tab(),
-                        KeyCode::Char('j') => app.scroll_down(),
-                        KeyCode::Char('k') => app.scroll_up(),
-                        KeyCode::Tab => app.next_tab(),
-                        _ => {}
-                    }
+                    app.handle_key(key.code);
                 }
             }
         }
