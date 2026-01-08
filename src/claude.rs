@@ -298,6 +298,9 @@ fn process_tool_results(
     tool_results_dir: Option<&Path>,
     project_dir: Option<&Path>,
 ) {
+    // Check for top-level toolUseResult (has agentId for Task tools)
+    let entry_tool_use_result = entry.get("toolUseResult");
+
     if let Some(Value::Array(arr)) = entry.get("message").and_then(|m| m.get("content")) {
         for item in arr {
             if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
@@ -306,7 +309,8 @@ fn process_tool_results(
 
             let tool_id = item.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("");
             if let Some(tool_use) = pending_tool_uses.remove(tool_id) {
-                let result = item.get("content");
+                // Prefer entry's toolUseResult (has agentId), fall back to item content
+                let result = entry_tool_use_result.or_else(|| item.get("content"));
                 let invocation = create_tool_invocation(tool_id, &tool_use, result, tool_results_dir, project_dir);
                 tool_invocations.push(invocation);
             }
@@ -534,12 +538,18 @@ fn parse_tool_type(
             let subagent_type = input.get("subagent_type").and_then(|s| s.as_str()).map(String::from);
             let result_str = extract_result_string(result, tool_id, tool_results_dir);
 
-            // Try to extract agentId from result and load subagent turns
-            let subagent_turns = result_str.as_ref()
-                .and_then(|r| extract_agent_id(r))
-                .and_then(|agent_id| {
+            // Try to extract agentId from result JSON (toolUseResult.agentId) or from text
+            let agent_id = result
+                .and_then(|r| r.get("agentId"))
+                .and_then(|id| id.as_str())
+                .map(String::from)
+                .or_else(|| result_str.as_ref().and_then(|r| extract_agent_id(r)));
+
+            // Load subagent turns if we have an agentId
+            let subagent_turns = agent_id
+                .and_then(|id| {
                     project_dir.and_then(|dir| {
-                        let agent_file = dir.join(format!("agent-{}.jsonl", agent_id));
+                        let agent_file = dir.join(format!("agent-{}.jsonl", id));
                         parse_agent_file(&agent_file).ok()
                     })
                 })
@@ -586,8 +596,37 @@ fn extract_result_string(result: Option<&Value>, tool_id: &str, tool_results_dir
         if let Some(s) = r.as_str() {
             return Some(s.to_string());
         }
+        // Try content as string
         if let Some(content) = r.get("content").and_then(|c| c.as_str()) {
             return Some(content.to_string());
+        }
+        // Try content as array of text blocks (from toolUseResult.content)
+        if let Some(content_arr) = r.get("content").and_then(|c| c.as_array()) {
+            let mut texts = Vec::new();
+            for item in content_arr {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        texts.push(text.to_string());
+                    }
+                }
+            }
+            if !texts.is_empty() {
+                return Some(texts.join("\n"));
+            }
+        }
+        // Handle result itself as array of content blocks
+        if let Some(arr) = r.as_array() {
+            let mut texts = Vec::new();
+            for item in arr {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        texts.push(text.to_string());
+                    }
+                }
+            }
+            if !texts.is_empty() {
+                return Some(texts.join("\n"));
+            }
         }
         if let Some(file) = r.get("file") {
             if let Some(content) = file.get("content").and_then(|c| c.as_str()) {
@@ -642,20 +681,16 @@ fn generate_unified_diff(old: &str, new: &str) -> String {
 /// Extract agentId from Task result string.
 /// The result typically ends with "agentId: abc123" or similar.
 fn extract_agent_id(result: &str) -> Option<String> {
-    // Look for "agentId: <id>" pattern at the end of the result
+    // Look for "agentId: <id>" pattern
     for line in result.lines().rev() {
         let line = line.trim();
-        if line.starts_with("agentId:") {
-            return Some(line.trim_start_matches("agentId:").trim().to_string());
-        }
-        // Also check for pattern like "(for resuming to continue this agent's work if needed)"
-        // which appears after the agentId
         if line.contains("agentId") {
             if let Some(pos) = line.find("agentId") {
-                let after = &line[pos + 7..].trim_start_matches(':').trim();
+                let after = &line[pos + 7..];
+                let after = after.trim_start_matches(':').trim();
                 // Extract just the ID part (before any parenthesis or space)
-                let id = after.split_whitespace().next()
-                    .or_else(|| after.split('(').next())
+                let id = after.split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
                     .map(|s| s.trim());
                 if let Some(id) = id {
                     if !id.is_empty() {
@@ -690,4 +725,105 @@ fn parse_agent_file(path: &Path) -> Result<Vec<Turn>, String> {
 
     // Build turns without recursively loading subagents (to avoid infinite loops)
     Ok(build_turns(&entries, None, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_agent_id_from_text() {
+        // Test agentId extraction from text
+        let text = "Some result text\nagentId: a0c970e (for resuming)";
+        assert_eq!(extract_agent_id(text), Some("a0c970e".to_string()));
+
+        let text2 = "agentId: abc123";
+        assert_eq!(extract_agent_id(text2), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_extract_result_string_from_tool_use_result() {
+        // Test extracting from toolUseResult object (has agentId at top level, content as array)
+        let tool_use_result = json!({
+            "status": "completed",
+            "agentId": "a0c970e",
+            "content": [
+                {"type": "text", "text": "First part of result"},
+                {"type": "text", "text": "agentId: a0c970e (for resuming)"}
+            ]
+        });
+
+        let result = extract_result_string(Some(&tool_use_result), "tool123", None);
+        assert!(result.is_some());
+        let result_str = result.unwrap();
+        assert!(result_str.contains("First part of result"));
+        assert!(result_str.contains("agentId: a0c970e"));
+    }
+
+    #[test]
+    fn test_extract_result_string_from_content_array() {
+        // Test extracting from content array directly
+        let content = json!([
+            {"type": "text", "text": "Result text here"},
+            {"type": "text", "text": "More text"}
+        ]);
+
+        let result = extract_result_string(Some(&content), "tool123", None);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("Result text here"));
+    }
+
+    #[test]
+    fn test_task_tool_gets_agent_id() {
+        // Test that Task tool properly extracts agentId from toolUseResult
+        let tool_use_result = json!({
+            "status": "completed",
+            "agentId": "test123",
+            "content": [
+                {"type": "text", "text": "Task completed successfully"}
+            ]
+        });
+
+        let input = json!({
+            "description": "Test task",
+            "prompt": "Do something",
+            "subagent_type": "Explore"
+        });
+
+        let (_tool_type, _, _) = parse_tool_type("Task", &input, Some(&tool_use_result), "tool1", None, None);
+
+        // Verify we can extract from the toolUseResult
+        assert!(tool_use_result.get("agentId").is_some());
+        assert_eq!(tool_use_result.get("agentId").unwrap().as_str(), Some("test123"));
+    }
+
+    #[test]
+    fn test_parse_real_session() {
+        // Test parsing the real promptui session and check for Task tools with subagent turns
+        let session_path = dirs::home_dir()
+            .map(|h| h.join(".claude/projects/-Users-dzhanguzin-dev-promptui/063cd168-91d2-41bd-b7ba-5d2dee7fc7ab.jsonl"));
+
+        if let Some(path) = session_path {
+            if path.exists() {
+                let session = parse_session(&path).expect("Should parse session");
+
+                // Find Task tools and check if any have subagent turns
+                let mut found_task_with_turns = false;
+                for turn in &session.turns {
+                    for tool in &turn.tool_invocations {
+                        if let ToolType::Task { subagent_turns, .. } = &tool.tool_type {
+                            if !subagent_turns.is_empty() {
+                                found_task_with_turns = true;
+                                println!("Found Task with {} subagent turns", subagent_turns.len());
+                            }
+                        }
+                    }
+                }
+
+                // This test will show if we're properly loading subagent turns
+                println!("Found Task with subagent turns: {}", found_task_with_turns);
+            }
+        }
+    }
 }

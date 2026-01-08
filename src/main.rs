@@ -14,7 +14,7 @@ use ratatui::{
     prelude::CrosstermBackend,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
 
@@ -69,6 +69,43 @@ impl DetailTab {
     }
 }
 
+/// A view context for navigating turns (main session or subagent)
+#[derive(Debug, Clone)]
+pub struct TurnContext {
+    pub title: String,
+    pub turns: Vec<Turn>,
+    pub turn_list_state: ListState,
+    pub active_tab: DetailTab,
+    pub scroll_offset: u16,
+    pub tool_scroll_offset: usize,
+}
+
+impl TurnContext {
+    fn new(title: String, turns: Vec<Turn>) -> Self {
+        let mut turn_list_state = ListState::default();
+        if !turns.is_empty() {
+            turn_list_state.select(Some(0));
+        }
+        Self {
+            title,
+            turns,
+            turn_list_state,
+            active_tab: DetailTab::Prompt,
+            scroll_offset: 0,
+            tool_scroll_offset: 0,
+        }
+    }
+
+    fn selected_turn(&self) -> Option<&Turn> {
+        self.turn_list_state.selected().and_then(|i| self.turns.get(i))
+    }
+
+    fn selected_tool(&self) -> Option<&ToolInvocation> {
+        self.selected_turn()
+            .and_then(|t| t.tool_invocations.get(self.tool_scroll_offset))
+    }
+}
+
 pub struct App {
     pub view: View,
     pub projects: Vec<ProjectInfo>,
@@ -77,10 +114,8 @@ pub struct App {
     pub selected_project: Option<ProjectInfo>,
     pub project_list_state: ListState,
     pub session_list_state: ListState,
-    pub turn_list_state: ListState,
-    pub active_tab: DetailTab,
-    pub scroll_offset: u16,
-    pub tool_scroll_offset: usize,
+    /// Stack of turn contexts (main session at bottom, subagents pushed on top)
+    pub context_stack: Vec<TurnContext>,
     pub should_quit: bool,
     pub error_message: Option<String>,
 }
@@ -101,19 +136,34 @@ impl App {
             selected_project: None,
             project_list_state,
             session_list_state: ListState::default(),
-            turn_list_state: ListState::default(),
-            active_tab: DetailTab::Prompt,
-            scroll_offset: 0,
-            tool_scroll_offset: 0,
+            context_stack: Vec::new(),
             should_quit: false,
             error_message: None,
         }
     }
 
-    pub fn selected_turn(&self) -> Option<&Turn> {
-        self.session.as_ref().and_then(|s| {
-            self.turn_list_state.selected().and_then(|i| s.turns.get(i))
-        })
+    /// Get the current (top) context
+    pub fn current_context(&self) -> Option<&TurnContext> {
+        self.context_stack.last()
+    }
+
+    /// Get mutable reference to current context
+    pub fn current_context_mut(&mut self) -> Option<&mut TurnContext> {
+        self.context_stack.last_mut()
+    }
+
+    /// Check if we're in a subagent view (depth > 1)
+    pub fn is_subagent_view(&self) -> bool {
+        self.context_stack.len() > 1
+    }
+
+    /// Get the breadcrumb path
+    pub fn breadcrumb(&self) -> String {
+        self.context_stack
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>()
+            .join(" > ")
     }
 
     fn select_next_in_list(state: &mut ListState, len: usize) {
@@ -139,7 +189,6 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
-        // Clear error on any key
         self.error_message = None;
 
         match self.view {
@@ -183,16 +232,12 @@ impl App {
                     if let Some(session_info) = self.sessions.get(i) {
                         match parse_session(&session_info.path) {
                             Ok(session) => {
+                                let context = TurnContext::new(
+                                    session.name.clone(),
+                                    session.turns.clone(),
+                                );
                                 self.session = Some(session);
-                                self.turn_list_state = ListState::default();
-                                if let Some(s) = &self.session {
-                                    if !s.turns.is_empty() {
-                                        self.turn_list_state.select(Some(0));
-                                    }
-                                }
-                                self.active_tab = DetailTab::Prompt;
-                                self.scroll_offset = 0;
-                                self.tool_scroll_offset = 0;
+                                self.context_stack = vec![context];
                                 self.view = View::SessionViewer;
                             }
                             Err(e) => {
@@ -208,60 +253,110 @@ impl App {
 
     fn handle_session_viewer_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') => {
                 self.view = View::SessionBrowser;
                 self.session = None;
+                self.context_stack.clear();
+            }
+            KeyCode::Esc => {
+                // Pop subagent context or go back to session browser
+                if self.context_stack.len() > 1 {
+                    self.context_stack.pop();
+                } else {
+                    self.view = View::SessionBrowser;
+                    self.session = None;
+                    self.context_stack.clear();
+                }
             }
             KeyCode::Up => {
-                if let Some(s) = &self.session {
-                    Self::select_prev_in_list(&mut self.turn_list_state, s.turns.len());
-                    self.scroll_offset = 0;
-                    self.tool_scroll_offset = 0;
+                if let Some(ctx) = self.current_context_mut() {
+                    let len = ctx.turns.len();
+                    Self::select_prev_in_list(&mut ctx.turn_list_state, len);
+                    ctx.scroll_offset = 0;
+                    ctx.tool_scroll_offset = 0;
                 }
             }
             KeyCode::Down => {
-                if let Some(s) = &self.session {
-                    Self::select_next_in_list(&mut self.turn_list_state, s.turns.len());
-                    self.scroll_offset = 0;
-                    self.tool_scroll_offset = 0;
+                if let Some(ctx) = self.current_context_mut() {
+                    let len = ctx.turns.len();
+                    Self::select_next_in_list(&mut ctx.turn_list_state, len);
+                    ctx.scroll_offset = 0;
+                    ctx.tool_scroll_offset = 0;
                 }
             }
             KeyCode::Left => {
-                self.active_tab = self.active_tab.prev();
-                self.scroll_offset = 0;
-                self.tool_scroll_offset = 0;
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.active_tab = ctx.active_tab.prev();
+                    ctx.scroll_offset = 0;
+                }
             }
             KeyCode::Right | KeyCode::Tab => {
-                self.active_tab = self.active_tab.next();
-                self.scroll_offset = 0;
-                self.tool_scroll_offset = 0;
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.active_tab = ctx.active_tab.next();
+                    ctx.scroll_offset = 0;
+                }
             }
             KeyCode::Char('j') => {
-                if self.active_tab == DetailTab::ToolCalls {
-                    if let Some(turn) = self.selected_turn() {
-                        if self.tool_scroll_offset < turn.tool_invocations.len().saturating_sub(1) {
-                            self.tool_scroll_offset += 1;
+                if let Some(ctx) = self.current_context_mut() {
+                    if ctx.active_tab == DetailTab::ToolCalls {
+                        let tool_count = ctx.selected_turn()
+                            .map(|t| t.tool_invocations.len())
+                            .unwrap_or(0);
+                        if ctx.tool_scroll_offset < tool_count.saturating_sub(1) {
+                            ctx.tool_scroll_offset += 1;
                         }
+                    } else {
+                        ctx.scroll_offset = ctx.scroll_offset.saturating_add(3);
                     }
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_add(3);
                 }
             }
             KeyCode::Char('k') => {
-                if self.active_tab == DetailTab::ToolCalls {
-                    self.tool_scroll_offset = self.tool_scroll_offset.saturating_sub(1);
-                } else {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                if let Some(ctx) = self.current_context_mut() {
+                    if ctx.active_tab == DetailTab::ToolCalls {
+                        ctx.tool_scroll_offset = ctx.tool_scroll_offset.saturating_sub(1);
+                    } else {
+                        ctx.scroll_offset = ctx.scroll_offset.saturating_sub(3);
+                    }
                 }
             }
             KeyCode::Char('g') => {
-                self.scroll_offset = 0;
-                self.tool_scroll_offset = 0;
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = 0;
+                    ctx.tool_scroll_offset = 0;
+                }
             }
             KeyCode::Char('G') => {
-                self.scroll_offset = u16::MAX;
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = u16::MAX;
+                }
+            }
+            KeyCode::Enter => {
+                // Try to open subagent if on Tool Calls tab and tool is openable
+                self.try_open_subagent();
             }
             _ => {}
+        }
+    }
+
+    fn try_open_subagent(&mut self) {
+        let subagent_data = self.current_context().and_then(|ctx| {
+            if ctx.active_tab != DetailTab::ToolCalls {
+                return None;
+            }
+            ctx.selected_tool().and_then(|tool| {
+                if let ToolType::Task { subagent_turns, subagent_type, description, .. } = &tool.tool_type {
+                    if !subagent_turns.is_empty() {
+                        let title = subagent_type.as_deref().unwrap_or(description.as_str()).to_string();
+                        return Some((title, subagent_turns.clone()));
+                    }
+                }
+                None
+            })
+        });
+
+        if let Some((title, turns)) = subagent_data {
+            let context = TurnContext::new(title, turns);
+            self.context_stack.push(context);
         }
     }
 }
@@ -277,7 +372,6 @@ fn ui(frame: &mut Frame, app: &mut App) {
         View::SessionViewer => render_session_viewer(frame, app),
     }
 
-    // Render error message if any
     if let Some(error) = &app.error_message {
         let area = frame.area();
         let error_area = Rect {
@@ -346,11 +440,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
                 })
                 .unwrap_or_default();
 
-            let display = if s.name.starts_with("agent-") {
-                format!("{} (agent) {}", &s.name[..20.min(s.name.len())], modified)
-            } else {
-                format!("{} {}", &s.name[..20.min(s.name.len())], modified)
-            };
+            let display = format!("{} {}", &s.name[..20.min(s.name.len())], modified);
             ListItem::new(display)
         })
         .collect();
@@ -378,11 +468,15 @@ fn render_session_viewer(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(session) = &app.session else {
+    frame.render_widget(Clear, area);
+
+    let is_subagent = app.is_subagent_view();
+
+    let Some(ctx) = app.current_context_mut() else {
         return;
     };
 
-    let items: Vec<ListItem> = session
+    let items: Vec<ListItem> = ctx
         .turns
         .iter()
         .enumerate()
@@ -404,7 +498,12 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let title = format!(" Turns ({}) - Esc to go back ", session.turns.len());
+    let title = if is_subagent {
+        format!(" {} ({} turns) - Esc to go back ", ctx.title, ctx.turns.len())
+    } else {
+        format!(" Turns ({}) - Esc to go back ", ctx.turns.len())
+    };
+
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(
@@ -414,124 +513,166 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
         )
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, area, &mut app.turn_list_state);
+    frame.render_stateful_widget(list, area, &mut ctx.turn_list_state);
 }
 
 fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(if app.is_subagent_view() { 2 } else { 1 }),
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
+
+    // Breadcrumb (only show if in subagent view)
+    if app.is_subagent_view() {
+        let breadcrumb = Paragraph::new(format!(" {} ", app.breadcrumb()))
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(breadcrumb, chunks[0]);
+    }
+
+    let tab_area = if app.is_subagent_view() { chunks[1] } else {
+        // Merge breadcrumb area into tab area when not in subagent
+        Rect {
+            y: chunks[0].y,
+            height: chunks[0].height + chunks[1].height,
+            ..chunks[1]
+        }
+    };
+    let content_area = chunks[2];
+    let help_area = chunks[3];
+
+    let Some(ctx) = app.current_context() else {
+        return;
+    };
 
     // Tab bar
     let tab_titles = vec!["Prompt", "Thinking", "Tool Calls", "Diff"];
     let tabs = Tabs::new(tab_titles)
         .block(Block::default().borders(Borders::ALL).title(" Details "))
-        .select(app.active_tab.index())
+        .select(ctx.active_tab.index())
         .style(Style::default().fg(Color::White))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         );
-    frame.render_widget(tabs, chunks[0]);
+    frame.render_widget(tabs, tab_area);
 
-    // Content
+    // Clear and render content
+    frame.render_widget(Clear, content_area);
     let content_block = Block::default().borders(Borders::ALL);
 
-    if let Some(turn) = app.selected_turn() {
-        let content: Text = match app.active_tab {
-            DetailTab::Prompt => {
-                let mut lines = vec![
-                    Line::styled("User Prompt:", Style::default().fg(Color::Cyan).bold()),
-                    Line::from(""),
-                ];
-                for line in turn.user_prompt.lines() {
-                    lines.push(Line::from(line));
-                }
-
-                if !turn.response.is_empty() {
-                    lines.push(Line::from(""));
-                    lines.push(Line::styled("─".repeat(40), Style::default().fg(Color::DarkGray)));
-                    lines.push(Line::from(""));
-                    lines.push(Line::styled("Response:", Style::default().fg(Color::Green).bold()));
-                    lines.push(Line::from(""));
-                    for line in turn.response.lines() {
-                        lines.push(Line::from(line));
-                    }
-                }
-
-                Text::from(lines)
-            }
-            DetailTab::Thinking => {
-                if let Some(thinking) = &turn.thinking {
-                    let mut lines = vec![
-                        Line::styled("Model Thinking:", Style::default().fg(Color::Magenta).bold()),
-                        Line::from(""),
-                    ];
-                    for line in thinking.lines() {
-                        lines.push(Line::from(line));
-                    }
-                    Text::from(lines)
-                } else {
-                    Text::styled("No thinking available for this turn", Style::default().fg(Color::DarkGray))
-                }
-            }
-            DetailTab::ToolCalls => {
-                if turn.tool_invocations.is_empty() {
-                    Text::styled("No tool calls in this turn", Style::default().fg(Color::DarkGray))
-                } else {
-                    render_tool_calls(turn, app.tool_scroll_offset)
-                }
-            }
-            DetailTab::Diff => {
-                render_diffs(turn)
-            }
+    if let Some(turn) = ctx.selected_turn() {
+        let content: Text = match ctx.active_tab {
+            DetailTab::Prompt => render_prompt_tab(turn),
+            DetailTab::Thinking => render_thinking_tab(turn),
+            DetailTab::ToolCalls => render_tool_calls_tab(turn, ctx.tool_scroll_offset),
+            DetailTab::Diff => render_diff_tab(turn),
         };
 
         let paragraph = Paragraph::new(content)
             .block(content_block)
             .wrap(Wrap { trim: false })
-            .scroll((app.scroll_offset, 0));
-        frame.render_widget(paragraph, chunks[1]);
+            .scroll((ctx.scroll_offset, 0));
+        frame.render_widget(paragraph, content_area);
     } else {
         let paragraph = Paragraph::new("Select a turn to view details")
             .block(content_block)
             .style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(paragraph, chunks[1]);
+        frame.render_widget(paragraph, content_area);
     }
 
     // Help line
-    let help_text = " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | g/G: Top/Bottom | Esc: Back ";
+    let help_text = if app.is_subagent_view() {
+        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open | Esc: Back "
+    } else {
+        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open subagent | q: Quit "
+    };
     let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
+    frame.render_widget(help, help_area);
 }
 
-fn render_tool_calls(turn: &Turn, scroll_offset: usize) -> Text<'static> {
+fn render_prompt_tab(turn: &Turn) -> Text<'static> {
+    let mut lines = vec![
+        Line::styled("User Prompt:".to_string(), Style::default().fg(Color::Cyan).bold()),
+        Line::from(""),
+    ];
+
+    for line in turn.user_prompt.lines() {
+        lines.push(Line::from(line.to_string()));
+    }
+
+    if !turn.response.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::styled("─".repeat(40), Style::default().fg(Color::DarkGray)));
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Response:".to_string(), Style::default().fg(Color::Green).bold()));
+        lines.push(Line::from(""));
+        for line in turn.response.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+    }
+
+    Text::from(lines)
+}
+
+fn render_thinking_tab(turn: &Turn) -> Text<'static> {
+    if let Some(thinking) = &turn.thinking {
+        let mut lines = vec![
+            Line::styled("Model Thinking:".to_string(), Style::default().fg(Color::Magenta).bold()),
+            Line::from(""),
+        ];
+        for line in thinking.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+        Text::from(lines)
+    } else {
+        Text::styled("No thinking available for this turn".to_string(), Style::default().fg(Color::DarkGray))
+    }
+}
+
+fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
+    if turn.tool_invocations.is_empty() {
+        return Text::styled("No tool calls in this turn".to_string(), Style::default().fg(Color::DarkGray));
+    }
+
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::styled(
-        format!("Tool Calls ({} total) - j/k to scroll between tools", turn.tool_invocations.len()),
+        format!("Tool Calls ({} total) - j/k to navigate, Enter to open subagent", turn.tool_invocations.len()),
         Style::default().fg(Color::Cyan).bold(),
     ));
     lines.push(Line::from(""));
 
     for (i, tool) in turn.tool_invocations.iter().enumerate() {
         let is_selected = i == scroll_offset;
-        let marker = if is_selected { "▶ " } else { "  " };
+        let is_openable = matches!(&tool.tool_type, ToolType::Task { subagent_turns, .. } if !subagent_turns.is_empty());
 
-        // Tool header with subagent info if applicable
+        // Visual indicator for openable tools
+        let marker = if is_selected {
+            if is_openable { "▶ " } else { "● " }
+        } else {
+            "  "
+        };
+
         let header_style = if is_selected {
             Style::default().fg(Color::Yellow).bold()
+        } else if is_openable {
+            Style::default().fg(Color::Magenta)
         } else {
             Style::default().fg(Color::White)
         };
 
+        // Tool label with subagent info
         let tool_label = match &tool.tool_type {
             ToolType::Task { subagent_type, subagent_turns, .. } => {
                 let type_info = subagent_type.as_deref().unwrap_or("Task");
                 if !subagent_turns.is_empty() {
-                    format!("{} ({} turns)", type_info, subagent_turns.len())
+                    format!("{} ({} turns) ⏎", type_info, subagent_turns.len())
                 } else {
                     type_info.to_string()
                 }
@@ -545,6 +686,7 @@ fn render_tool_calls(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             Span::styled(tool_label, header_style),
         ]));
 
+        // Show details for selected tool
         if is_selected {
             lines.push(Line::from(""));
 
@@ -556,89 +698,37 @@ fn render_tool_calls(turn: &Turn, scroll_offset: usize) -> Text<'static> {
 
             lines.push(Line::from(""));
 
-            // For Task tools, show subagent turns
-            if let ToolType::Task { subagent_turns, prompt, .. } = &tool.tool_type {
-                if !subagent_turns.is_empty() {
-                    lines.push(Line::styled("  Subagent Execution:".to_string(), Style::default().fg(Color::Magenta).bold()));
-                    lines.push(Line::from(""));
-
-                    for (j, subturn) in subagent_turns.iter().enumerate() {
-                        // Subagent turn header
-                        lines.push(Line::styled(
-                            format!("  ── Turn {} ──", j + 1),
-                            Style::default().fg(Color::DarkGray),
-                        ));
-
-                        // Show thinking if available
-                        if let Some(thinking) = &subturn.thinking {
-                            lines.push(Line::styled("    Thinking:".to_string(), Style::default().fg(Color::Blue)));
-                            let thinking_preview: String = thinking.chars().take(200).collect();
-                            for line in thinking_preview.lines() {
-                                lines.push(Line::from(format!("      {}", line)));
-                            }
-                            if thinking.chars().count() > 200 {
-                                lines.push(Line::styled("      ...".to_string(), Style::default().fg(Color::DarkGray)));
-                            }
-                        }
-
-                        // Show tool calls summary
-                        if !subturn.tool_invocations.is_empty() {
-                            lines.push(Line::styled(
-                                format!("    Tools: {}", subturn.tool_invocations.iter()
-                                    .map(|t| t.tool_type.name())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")),
-                                Style::default().fg(Color::Cyan),
-                            ));
-                        }
-
-                        // Show response preview
-                        if !subturn.response.is_empty() {
-                            lines.push(Line::styled("    Response:".to_string(), Style::default().fg(Color::Green)));
-                            let response_preview: String = subturn.response.chars().take(150).collect();
-                            for line in response_preview.lines().take(3) {
-                                lines.push(Line::from(format!("      {}", line)));
-                            }
-                            if subturn.response.lines().count() > 3 || subturn.response.chars().count() > 150 {
-                                lines.push(Line::styled("      ...".to_string(), Style::default().fg(Color::DarkGray)));
-                            }
-                        }
-
-                        lines.push(Line::from(""));
-                    }
-                } else if !prompt.is_empty() {
-                    // No subagent turns loaded, show result
-                    lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
-                    for line in tool.output_display.lines().take(20) {
-                        lines.push(Line::from(format!("    {}", line)));
-                    }
-                    lines.push(Line::from(""));
-                }
-            } else {
-                // Output for non-Task tools
-                lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
-                for line in tool.output_display.lines().take(20) {
-                    lines.push(Line::from(format!("    {}", line)));
-                }
-                if tool.output_display.lines().count() > 20 {
-                    lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
-                }
-                lines.push(Line::from(""));
+            // Output
+            lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
+            for line in tool.output_display.lines().take(30) {
+                lines.push(Line::from(format!("    {}", line)));
             }
+            if tool.output_display.lines().count() > 30 {
+                lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
+            }
+
+            // Hint for openable tools
+            if is_openable {
+                lines.push(Line::from(""));
+                lines.push(Line::styled(
+                    "  Press Enter to view subagent conversation".to_string(),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
+                ));
+            }
+
+            lines.push(Line::from(""));
         }
     }
 
     Text::from(lines)
 }
 
-fn render_diffs(turn: &Turn) -> Text<'static> {
+fn render_diff_tab(turn: &Turn) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     let mut has_diff = false;
 
-    // Helper to render a single diff
     fn render_diff(lines: &mut Vec<Line>, tool: &ToolInvocation, prefix: &str) -> bool {
         if let Some(diff) = tool.tool_type.diff() {
-            // File header
             let path = match &tool.tool_type {
                 ToolType::FileEdit { path, .. } => path.clone(),
                 ToolType::FileWrite { path, .. } => path.clone(),
@@ -654,7 +744,6 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
             lines.push(Line::styled(header, Style::default().fg(Color::Cyan).bold()));
             lines.push(Line::from(""));
 
-            // Diff content with syntax highlighting
             for line in diff.lines() {
                 let line_owned = line.to_string();
                 let styled_line = if line.starts_with('+') && !line.starts_with("+++") {
@@ -682,7 +771,7 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
             has_diff = true;
         }
 
-        // Also collect diffs from subagent turns
+        // Collect diffs from subagent turns
         if let ToolType::Task { subagent_turns, subagent_type, .. } = &tool.tool_type {
             if !subagent_turns.is_empty() {
                 let prefix = format!("[{}]", subagent_type.as_deref().unwrap_or("subagent"));
@@ -698,7 +787,7 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
     }
 
     if !has_diff {
-        return Text::styled("No diffs available for this turn", Style::default().fg(Color::DarkGray));
+        return Text::styled("No diffs available for this turn".to_string(), Style::default().fg(Color::DarkGray));
     }
 
     Text::from(lines)
@@ -711,15 +800,12 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // Setup terminal
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    // Create app
     let mut app = App::new();
 
-    // Main loop
     while !app.should_quit {
         terminal.draw(|frame| ui(frame, &mut app))?;
 
@@ -732,7 +818,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
