@@ -593,6 +593,16 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(help, help_area);
 }
 
+/// Truncate a string to max_chars, adding "…" if truncated
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.chars().count() > max_chars {
+        format!("{}…", s.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+    } else {
+        s.to_string()
+    }
+}
+
 fn render_prompt_tab(turn: &Turn) -> Text<'static> {
     let mut lines = vec![
         Line::styled("User Prompt:".to_string(), Style::default().fg(Color::Cyan).bold()),
@@ -664,23 +674,64 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             Style::default().fg(Color::White)
         };
 
-        // Tool label with subagent info
-        let tool_label = match &tool.tool_type {
-            ToolType::Task { subagent_type, subagent_turns, .. } => {
+        // Tool label with context snippet
+        let (tool_label, tool_context) = match &tool.tool_type {
+            ToolType::Task { subagent_type, subagent_turns, description, .. } => {
                 let type_info = subagent_type.as_deref().unwrap_or("Task");
-                if !subagent_turns.is_empty() {
+                let label = if !subagent_turns.is_empty() {
                     format!("{} ({} turns) ⏎", type_info, subagent_turns.len())
                 } else {
                     type_info.to_string()
-                }
+                };
+                let context = truncate_str(description, 40);
+                (label, context)
             }
-            _ => tool.tool_type.name().to_string(),
+            ToolType::FileRead { path, .. } => {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                (tool.tool_type.name().to_string(), truncate_str(name, 50))
+            }
+            ToolType::FileWrite { path, .. } => {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                (tool.tool_type.name().to_string(), truncate_str(name, 50))
+            }
+            ToolType::FileEdit { path, .. } => {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                (tool.tool_type.name().to_string(), truncate_str(name, 50))
+            }
+            ToolType::Command { command, .. } => {
+                let cmd = command.lines().next().unwrap_or(command);
+                (tool.tool_type.name().to_string(), truncate_str(cmd, 50))
+            }
+            ToolType::Search { pattern, .. } => {
+                (tool.tool_type.name().to_string(), truncate_str(pattern, 50))
+            }
+            ToolType::WebFetch { url, .. } => {
+                (tool.tool_type.name().to_string(), truncate_str(url, 50))
+            }
+            ToolType::WebSearch { query, .. } => {
+                (tool.tool_type.name().to_string(), truncate_str(query, 50))
+            }
+            ToolType::TodoUpdate { todos } => {
+                let summary = format!("{} items", todos.len());
+                (tool.tool_type.name().to_string(), summary)
+            }
+            ToolType::Other { name } => {
+                (name.clone(), String::new())
+            }
+        };
+
+        let context_style = Style::default().fg(Color::DarkGray);
+        let context_span = if tool_context.is_empty() {
+            Span::raw("")
+        } else {
+            Span::styled(format!(" {}", tool_context), context_style)
         };
 
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::DarkGray)),
             Span::styled(tool_label, header_style),
+            context_span,
         ]));
 
         // Show details for selected tool
