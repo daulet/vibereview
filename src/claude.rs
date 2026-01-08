@@ -579,9 +579,11 @@ fn extract_result_string(result: Option<&Value>, tool_id: &str, tool_results_dir
     None
 }
 
-fn truncate_display(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count > max_chars {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
     } else {
         s.to_string()
     }
