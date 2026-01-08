@@ -83,7 +83,11 @@ pub enum ToolType {
     },
     Task {
         description: String,
+        prompt: String,
+        subagent_type: Option<String>,
         result: Option<String>,
+        /// Embedded subagent turns (parsed from agent-{id}.jsonl)
+        subagent_turns: Vec<Turn>,
     },
     Other {
         name: String,

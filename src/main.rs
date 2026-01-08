@@ -19,7 +19,7 @@ use ratatui::{
 };
 
 use claude::{list_projects, list_sessions, parse_session, ProjectInfo, SessionInfo};
-use models::{Session, ToolType, Turn};
+use models::{Session, ToolInvocation, ToolType, Turn};
 
 // =============================================================================
 // App State
@@ -520,17 +520,29 @@ fn render_tool_calls(turn: &Turn, scroll_offset: usize) -> Text<'static> {
         let is_selected = i == scroll_offset;
         let marker = if is_selected { "▶ " } else { "  " };
 
-        // Tool header
+        // Tool header with subagent info if applicable
         let header_style = if is_selected {
             Style::default().fg(Color::Yellow).bold()
         } else {
             Style::default().fg(Color::White)
         };
 
+        let tool_label = match &tool.tool_type {
+            ToolType::Task { subagent_type, subagent_turns, .. } => {
+                let type_info = subagent_type.as_deref().unwrap_or("Task");
+                if !subagent_turns.is_empty() {
+                    format!("{} ({} turns)", type_info, subagent_turns.len())
+                } else {
+                    type_info.to_string()
+                }
+            }
+            _ => tool.tool_type.name().to_string(),
+        };
+
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::DarkGray)),
-            Span::styled(tool.tool_type.name().to_string(), header_style),
+            Span::styled(tool_label, header_style),
         ]));
 
         if is_selected {
@@ -544,16 +556,75 @@ fn render_tool_calls(turn: &Turn, scroll_offset: usize) -> Text<'static> {
 
             lines.push(Line::from(""));
 
-            // Output
-            lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
-            for line in tool.output_display.lines().take(20) {
-                lines.push(Line::from(format!("    {}", line)));
-            }
-            if tool.output_display.lines().count() > 20 {
-                lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
-            }
+            // For Task tools, show subagent turns
+            if let ToolType::Task { subagent_turns, prompt, .. } = &tool.tool_type {
+                if !subagent_turns.is_empty() {
+                    lines.push(Line::styled("  Subagent Execution:".to_string(), Style::default().fg(Color::Magenta).bold()));
+                    lines.push(Line::from(""));
 
-            lines.push(Line::from(""));
+                    for (j, subturn) in subagent_turns.iter().enumerate() {
+                        // Subagent turn header
+                        lines.push(Line::styled(
+                            format!("  ── Turn {} ──", j + 1),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+
+                        // Show thinking if available
+                        if let Some(thinking) = &subturn.thinking {
+                            lines.push(Line::styled("    Thinking:".to_string(), Style::default().fg(Color::Blue)));
+                            let thinking_preview: String = thinking.chars().take(200).collect();
+                            for line in thinking_preview.lines() {
+                                lines.push(Line::from(format!("      {}", line)));
+                            }
+                            if thinking.chars().count() > 200 {
+                                lines.push(Line::styled("      ...".to_string(), Style::default().fg(Color::DarkGray)));
+                            }
+                        }
+
+                        // Show tool calls summary
+                        if !subturn.tool_invocations.is_empty() {
+                            lines.push(Line::styled(
+                                format!("    Tools: {}", subturn.tool_invocations.iter()
+                                    .map(|t| t.tool_type.name())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                        }
+
+                        // Show response preview
+                        if !subturn.response.is_empty() {
+                            lines.push(Line::styled("    Response:".to_string(), Style::default().fg(Color::Green)));
+                            let response_preview: String = subturn.response.chars().take(150).collect();
+                            for line in response_preview.lines().take(3) {
+                                lines.push(Line::from(format!("      {}", line)));
+                            }
+                            if subturn.response.lines().count() > 3 || subturn.response.chars().count() > 150 {
+                                lines.push(Line::styled("      ...".to_string(), Style::default().fg(Color::DarkGray)));
+                            }
+                        }
+
+                        lines.push(Line::from(""));
+                    }
+                } else if !prompt.is_empty() {
+                    // No subagent turns loaded, show result
+                    lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
+                    for line in tool.output_display.lines().take(20) {
+                        lines.push(Line::from(format!("    {}", line)));
+                    }
+                    lines.push(Line::from(""));
+                }
+            } else {
+                // Output for non-Task tools
+                lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
+                for line in tool.output_display.lines().take(20) {
+                    lines.push(Line::from(format!("    {}", line)));
+                }
+                if tool.output_display.lines().count() > 20 {
+                    lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
+                }
+                lines.push(Line::from(""));
+            }
         }
     }
 
@@ -564,10 +635,9 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     let mut has_diff = false;
 
-    for tool in &turn.tool_invocations {
+    // Helper to render a single diff
+    fn render_diff(lines: &mut Vec<Line>, tool: &ToolInvocation, prefix: &str) -> bool {
         if let Some(diff) = tool.tool_type.diff() {
-            has_diff = true;
-
             // File header
             let path = match &tool.tool_type {
                 ToolType::FileEdit { path, .. } => path.clone(),
@@ -575,10 +645,13 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
                 _ => "unknown".to_string(),
             };
 
-            lines.push(Line::styled(
-                format!("─── {} ───", path),
-                Style::default().fg(Color::Cyan).bold(),
-            ));
+            let header = if prefix.is_empty() {
+                format!("─── {} ───", path)
+            } else {
+                format!("─── {} {} ───", prefix, path)
+            };
+
+            lines.push(Line::styled(header, Style::default().fg(Color::Cyan).bold()));
             lines.push(Line::from(""));
 
             // Diff content with syntax highlighting
@@ -599,6 +672,28 @@ fn render_diffs(turn: &Turn) -> Text<'static> {
             }
 
             lines.push(Line::from(""));
+            return true;
+        }
+        false
+    }
+
+    for tool in &turn.tool_invocations {
+        if render_diff(&mut lines, tool, "") {
+            has_diff = true;
+        }
+
+        // Also collect diffs from subagent turns
+        if let ToolType::Task { subagent_turns, subagent_type, .. } = &tool.tool_type {
+            if !subagent_turns.is_empty() {
+                let prefix = format!("[{}]", subagent_type.as_deref().unwrap_or("subagent"));
+                for subturn in subagent_turns {
+                    for subtool in &subturn.tool_invocations {
+                        if render_diff(&mut lines, subtool, &prefix) {
+                            has_diff = true;
+                        }
+                    }
+                }
+            }
         }
     }
 

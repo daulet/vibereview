@@ -50,7 +50,7 @@ pub struct ProjectInfo {
     pub decoded_path: String,
 }
 
-/// List sessions in a project.
+/// List sessions in a project (excludes agent-* files which are embedded in parent sessions).
 pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     let Ok(entries) = fs::read_dir(project_path) else {
         return Vec::new();
@@ -61,6 +61,10 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
         let path = entry.path();
         if path.extension().map_or(false, |e| e == "jsonl") {
             let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            // Skip agent files - they'll be embedded in parent sessions
+            if name.starts_with("agent-") {
+                continue;
+            }
             // Get file metadata for sorting by modification time
             let modified = fs::metadata(&path)
                 .and_then(|m| m.modified())
@@ -91,7 +95,8 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     let reader = BufReader::new(file);
 
     let session_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-    let tool_results_dir = path.parent().map(|p| p.join(&session_id).join("tool-results"));
+    let project_dir = path.parent();
+    let tool_results_dir = project_dir.map(|p| p.join(&session_id).join("tool-results"));
 
     let mut entries: Vec<Value> = Vec::new();
     for line in reader.lines() {
@@ -105,7 +110,7 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     }
 
     // Build turns by pairing user messages with assistant responses
-    let turns = build_turns(&entries, tool_results_dir.as_deref());
+    let turns = build_turns(&entries, tool_results_dir.as_deref(), project_dir);
 
     // Extract session metadata
     let version = entries
@@ -129,7 +134,7 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     })
 }
 
-fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>) -> Vec<Turn> {
+fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, project_dir: Option<&Path>) -> Vec<Turn> {
     let mut turns = Vec::new();
     let mut i = 0;
 
@@ -171,6 +176,7 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>) -> Vec<Turn> 
                         &mut pending_tool_uses,
                         &mut tool_invocations,
                         tool_results_dir,
+                        project_dir,
                     );
                     i += 1;
                     continue;
@@ -220,7 +226,7 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>) -> Vec<Turn> 
                     // Find the corresponding tool use in pending
                     if let Some(tool_id) = find_tool_id_for_result(next_entry) {
                         if let Some(tool_use) = pending_tool_uses.remove(&tool_id) {
-                            let invocation = create_tool_invocation(&tool_id, &tool_use, Some(tool_result), tool_results_dir);
+                            let invocation = create_tool_invocation(&tool_id, &tool_use, Some(tool_result), tool_results_dir, project_dir);
                             tool_invocations.push(invocation);
                         }
                     }
@@ -232,7 +238,7 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>) -> Vec<Turn> 
 
         // Add any remaining tool uses without results
         for (tool_id, tool_use) in pending_tool_uses {
-            let invocation = create_tool_invocation(&tool_id, &tool_use, None, tool_results_dir);
+            let invocation = create_tool_invocation(&tool_id, &tool_use, None, tool_results_dir, project_dir);
             tool_invocations.push(invocation);
         }
 
@@ -290,6 +296,7 @@ fn process_tool_results(
     pending_tool_uses: &mut HashMap<String, Value>,
     tool_invocations: &mut Vec<ToolInvocation>,
     tool_results_dir: Option<&Path>,
+    project_dir: Option<&Path>,
 ) {
     if let Some(Value::Array(arr)) = entry.get("message").and_then(|m| m.get("content")) {
         for item in arr {
@@ -300,7 +307,7 @@ fn process_tool_results(
             let tool_id = item.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("");
             if let Some(tool_use) = pending_tool_uses.remove(tool_id) {
                 let result = item.get("content");
-                let invocation = create_tool_invocation(tool_id, &tool_use, result, tool_results_dir);
+                let invocation = create_tool_invocation(tool_id, &tool_use, result, tool_results_dir, project_dir);
                 tool_invocations.push(invocation);
             }
         }
@@ -324,11 +331,12 @@ fn create_tool_invocation(
     tool_use: &Value,
     result: Option<&Value>,
     tool_results_dir: Option<&Path>,
+    project_dir: Option<&Path>,
 ) -> ToolInvocation {
     let tool_name = tool_use.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
     let input = tool_use.get("input").cloned().unwrap_or(Value::Null);
 
-    let (tool_type, input_display, output_display) = parse_tool_type(tool_name, &input, result, tool_id, tool_results_dir);
+    let (tool_type, input_display, output_display) = parse_tool_type(tool_name, &input, result, tool_id, tool_results_dir, project_dir);
 
     ToolInvocation {
         id: tool_id.to_string(),
@@ -346,6 +354,7 @@ fn parse_tool_type(
     result: Option<&Value>,
     tool_id: &str,
     tool_results_dir: Option<&Path>,
+    project_dir: Option<&Path>,
 ) -> (ToolType, String, String) {
     match tool_name {
         "Read" => {
@@ -521,15 +530,39 @@ fn parse_tool_type(
         }
         "Task" => {
             let description = input.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-            let prompt = input.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+            let prompt = input.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string();
+            let subagent_type = input.get("subagent_type").and_then(|s| s.as_str()).map(String::from);
             let result_str = extract_result_string(result, tool_id, tool_results_dir);
 
-            let input_display = format!("{}\n{}", description, truncate_display(prompt, 200));
+            // Try to extract agentId from result and load subagent turns
+            let subagent_turns = result_str.as_ref()
+                .and_then(|r| extract_agent_id(r))
+                .and_then(|agent_id| {
+                    project_dir.and_then(|dir| {
+                        let agent_file = dir.join(format!("agent-{}.jsonl", agent_id));
+                        parse_agent_file(&agent_file).ok()
+                    })
+                })
+                .unwrap_or_default();
+
+            let input_display = format!("{}\n{}", description, truncate_display(&prompt, 200));
+            let turn_count = subagent_turns.len();
+            let output_display = if turn_count > 0 {
+                format!("[{} subagent turns]", turn_count)
+            } else {
+                truncate_display(&result_str.clone().unwrap_or_default(), 500)
+            };
 
             (
-                ToolType::Task { description, result: result_str.clone() },
+                ToolType::Task {
+                    description,
+                    prompt,
+                    subagent_type,
+                    result: result_str,
+                    subagent_turns,
+                },
                 input_display,
-                truncate_display(&result_str.unwrap_or_default(), 500),
+                output_display,
             )
         }
         _ => {
@@ -604,4 +637,57 @@ fn generate_unified_diff(old: &str, new: &str) -> String {
     }
 
     result.join("\n")
+}
+
+/// Extract agentId from Task result string.
+/// The result typically ends with "agentId: abc123" or similar.
+fn extract_agent_id(result: &str) -> Option<String> {
+    // Look for "agentId: <id>" pattern at the end of the result
+    for line in result.lines().rev() {
+        let line = line.trim();
+        if line.starts_with("agentId:") {
+            return Some(line.trim_start_matches("agentId:").trim().to_string());
+        }
+        // Also check for pattern like "(for resuming to continue this agent's work if needed)"
+        // which appears after the agentId
+        if line.contains("agentId") {
+            if let Some(pos) = line.find("agentId") {
+                let after = &line[pos + 7..].trim_start_matches(':').trim();
+                // Extract just the ID part (before any parenthesis or space)
+                let id = after.split_whitespace().next()
+                    .or_else(|| after.split('(').next())
+                    .map(|s| s.trim());
+                if let Some(id) = id {
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse an agent file and return its turns.
+fn parse_agent_file(path: &Path) -> Result<Vec<Turn>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path).map_err(|e| format!("Failed to open agent file: {}", e))?;
+    let reader = BufReader::new(file);
+
+    let mut entries: Vec<Value> = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            entries.push(value);
+        }
+    }
+
+    // Build turns without recursively loading subagents (to avoid infinite loops)
+    Ok(build_turns(&entries, None, None))
 }
