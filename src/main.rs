@@ -222,7 +222,8 @@ impl App {
 
     fn handle_session_browser_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
                 self.view = View::ProjectBrowser;
             }
             KeyCode::Up => Self::select_prev_in_list(&mut self.session_list_state, self.sessions.len()),
@@ -253,11 +254,7 @@ impl App {
 
     fn handle_session_viewer_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char('q') => {
-                self.view = View::SessionBrowser;
-                self.session = None;
-                self.context_stack.clear();
-            }
+            KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
                 // Pop subagent context or go back to session browser
                 if self.context_stack.len() > 1 {
@@ -588,9 +585,9 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     // Help line
     let help_text = if app.is_subagent_view() {
-        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open | Esc: Back "
+        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open | Esc: Back | q: Quit "
     } else {
-        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open subagent | q: Quit "
+        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open subagent | Esc: Back | q: Quit "
     };
     let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, help_area);

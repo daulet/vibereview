@@ -522,7 +522,14 @@ fn parse_tool_type(
                 .unwrap_or_default();
 
             let input_display = todos.iter()
-                .map(|t| format!("[{}] {}", t.status, t.content))
+                .map(|t| {
+                    let checkbox = match t.status.as_str() {
+                        "completed" => "- [x]",
+                        "in_progress" => "- [~]",
+                        _ => "- [ ]", // pending or other
+                    };
+                    format!("{} {}", checkbox, t.content)
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -662,17 +669,27 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
 }
 
 fn generate_unified_diff(old: &str, new: &str) -> String {
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
+    use similar::{ChangeTag, TextDiff};
 
+    let diff = TextDiff::from_lines(old, new);
     let mut result = Vec::new();
-    result.push(format!("@@ -1,{} +1,{} @@", old_lines.len(), new_lines.len()));
 
-    for line in &old_lines {
-        result.push(format!("-{}", line));
-    }
-    for line in &new_lines {
-        result.push(format!("+{}", line));
+    for (idx, group) in diff.grouped_ops(3).iter().enumerate() {
+        if idx > 0 {
+            result.push(String::new());
+        }
+
+        for op in group {
+            for change in diff.iter_changes(op) {
+                let tag = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                let value = change.value().trim_end_matches('\n');
+                result.push(format!("{}{}", tag, value));
+            }
+        }
     }
 
     result.join("\n")
@@ -1008,8 +1025,9 @@ mod tests {
         } else {
             panic!("Expected TodoUpdate tool type");
         }
-        assert!(input_display.contains("[completed] Fix bug"));
-        assert!(input_display.contains("[in_progress] Add tests"));
+        assert!(input_display.contains("- [x] Fix bug"));
+        assert!(input_display.contains("- [~] Add tests"));
+        assert!(input_display.contains("- [ ] Deploy"));
     }
 
     #[test]
