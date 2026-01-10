@@ -20,6 +20,7 @@ use ratatui::{
 };
 
 use claude::{list_projects, list_sessions, parse_session, ProjectInfo, SessionInfo};
+use codex::{list_codex_sessions, parse_codex_session, CodexSessionInfo};
 use models::{Session, ToolInvocation, ToolType, Turn};
 
 // =============================================================================
@@ -27,9 +28,16 @@ use models::{Session, ToolInvocation, ToolType, Turn};
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
-    ProjectBrowser,
-    SessionBrowser,
+    SourceSelector,
+    ProjectBrowser,    // Claude only
+    SessionBrowser,    // Both (Claude after project, Codex directly)
     SessionViewer,
 }
 
@@ -109,12 +117,19 @@ impl TurnContext {
 
 pub struct App {
     pub view: View,
+    pub source: Source,
+    pub source_list_state: ListState,
+    // Claude state
     pub projects: Vec<ProjectInfo>,
     pub sessions: Vec<SessionInfo>,
-    pub session: Option<Session>,
     pub selected_project: Option<ProjectInfo>,
     pub project_list_state: ListState,
     pub session_list_state: ListState,
+    // Codex state
+    pub codex_sessions: Vec<CodexSessionInfo>,
+    pub codex_session_list_state: ListState,
+    // Common state
+    pub session: Option<Session>,
     /// Stack of turn contexts (main session at bottom, subagents pushed on top)
     pub context_stack: Vec<TurnContext>,
     pub should_quit: bool,
@@ -123,20 +138,21 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let projects = list_projects();
-        let mut project_list_state = ListState::default();
-        if !projects.is_empty() {
-            project_list_state.select(Some(0));
-        }
+        let mut source_list_state = ListState::default();
+        source_list_state.select(Some(0));
 
         Self {
-            view: View::ProjectBrowser,
-            projects,
+            view: View::SourceSelector,
+            source: Source::Claude,
+            source_list_state,
+            projects: Vec::new(),
             sessions: Vec::new(),
-            session: None,
             selected_project: None,
-            project_list_state,
+            project_list_state: ListState::default(),
             session_list_state: ListState::default(),
+            codex_sessions: Vec::new(),
+            codex_session_list_state: ListState::default(),
+            session: None,
             context_stack: Vec::new(),
             should_quit: false,
             error_message: None,
@@ -193,15 +209,53 @@ impl App {
         self.error_message = None;
 
         match self.view {
+            View::SourceSelector => self.handle_source_selector_key(key),
             View::ProjectBrowser => self.handle_project_browser_key(key),
             View::SessionBrowser => self.handle_session_browser_key(key),
             View::SessionViewer => self.handle_session_viewer_key(key),
         }
     }
 
-    fn handle_project_browser_key(&mut self, key: KeyCode) {
+    fn handle_source_selector_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Up => Self::select_prev_in_list(&mut self.source_list_state, 2),
+            KeyCode::Down => Self::select_next_in_list(&mut self.source_list_state, 2),
+            KeyCode::Enter => {
+                match self.source_list_state.selected() {
+                    Some(0) => {
+                        // Claude Code
+                        self.source = Source::Claude;
+                        self.projects = list_projects();
+                        self.project_list_state = ListState::default();
+                        if !self.projects.is_empty() {
+                            self.project_list_state.select(Some(0));
+                        }
+                        self.view = View::ProjectBrowser;
+                    }
+                    Some(1) => {
+                        // Codex
+                        self.source = Source::Codex;
+                        self.codex_sessions = list_codex_sessions();
+                        self.codex_session_list_state = ListState::default();
+                        if !self.codex_sessions.is_empty() {
+                            self.codex_session_list_state.select(Some(0));
+                        }
+                        self.view = View::SessionBrowser;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_project_browser_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                self.view = View::SourceSelector;
+            }
             KeyCode::Up => Self::select_prev_in_list(&mut self.project_list_state, self.projects.len()),
             KeyCode::Down => Self::select_next_in_list(&mut self.project_list_state, self.projects.len()),
             KeyCode::Enter => {
@@ -222,6 +276,13 @@ impl App {
     }
 
     fn handle_session_browser_key(&mut self, key: KeyCode) {
+        match self.source {
+            Source::Claude => self.handle_claude_session_browser_key(key),
+            Source::Codex => self.handle_codex_session_browser_key(key),
+        }
+    }
+
+    fn handle_claude_session_browser_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
@@ -233,6 +294,38 @@ impl App {
                 if let Some(i) = self.session_list_state.selected() {
                     if let Some(session_info) = self.sessions.get(i) {
                         match parse_session(&session_info.path) {
+                            Ok(session) => {
+                                let context = TurnContext::new(
+                                    session.name.clone(),
+                                    session.turns.clone(),
+                                );
+                                self.session = Some(session);
+                                self.context_stack = vec![context];
+                                self.view = View::SessionViewer;
+                            }
+                            Err(e) => {
+                                self.error_message = Some(format!("Failed to parse session: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_codex_session_browser_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => {
+                self.view = View::SourceSelector;
+            }
+            KeyCode::Up => Self::select_prev_in_list(&mut self.codex_session_list_state, self.codex_sessions.len()),
+            KeyCode::Down => Self::select_next_in_list(&mut self.codex_session_list_state, self.codex_sessions.len()),
+            KeyCode::Enter => {
+                if let Some(i) = self.codex_session_list_state.selected() {
+                    if let Some(session_info) = self.codex_sessions.get(i) {
+                        match parse_codex_session(&session_info.path) {
                             Ok(session) => {
                                 let context = TurnContext::new(
                                     session.name.clone(),
@@ -365,6 +458,7 @@ impl App {
 
 fn ui(frame: &mut Frame, app: &mut App) {
     match app.view {
+        View::SourceSelector => render_source_selector(frame, app),
         View::ProjectBrowser => render_project_browser(frame, app),
         View::SessionBrowser => render_session_browser(frame, app),
         View::SessionViewer => render_session_viewer(frame, app),
@@ -382,6 +476,30 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
         frame.render_widget(error_msg, error_area);
     }
+}
+
+fn render_source_selector(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+
+    let items: Vec<ListItem> = vec![
+        ListItem::new("  Claude Code  - ~/.claude/projects/"),
+        ListItem::new("  Codex CLI    - ~/.codex/sessions/"),
+    ];
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Select Source (Enter to open, q to quit) "),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶");
+
+    frame.render_stateful_widget(list, area, &mut app.source_list_state);
 }
 
 fn render_project_browser(frame: &mut Frame, app: &mut App) {
@@ -412,6 +530,13 @@ fn render_project_browser(frame: &mut Frame, app: &mut App) {
 fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    match app.source {
+        Source::Claude => render_claude_session_browser(frame, app, area),
+        Source::Codex => render_codex_session_browser(frame, app, area),
+    }
+}
+
+fn render_claude_session_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = if let Some(p) = &app.selected_project {
         format!(" Sessions in {} (Esc to go back) ", p.decoded_path)
     } else {
@@ -422,22 +547,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .sessions
         .iter()
         .map(|s| {
-            let modified = s.modified
-                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| {
-                    let secs = d.as_secs();
-                    let hours_ago = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|n| n.as_secs())
-                        .unwrap_or(secs) - secs) / 3600;
-                    if hours_ago < 24 {
-                        format!("{}h ago", hours_ago)
-                    } else {
-                        format!("{}d ago", hours_ago / 24)
-                    }
-                })
-                .unwrap_or_default();
-
+            let modified = format_time_ago(s.modified);
             let display = format!("{} {}", &s.name[..20.min(s.name.len())], modified);
             ListItem::new(display)
         })
@@ -453,6 +563,50 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, area, &mut app.session_list_state);
+}
+
+fn render_codex_session_browser(frame: &mut Frame, app: &mut App, area: Rect) {
+    let title = " Codex Sessions (Esc to go back) ";
+
+    let items: Vec<ListItem> = app
+        .codex_sessions
+        .iter()
+        .map(|s| {
+            let modified = format_time_ago(s.modified);
+            let name_display = truncate_str(&s.name, 40);
+            let display = format!("{} {}", name_display, modified);
+            ListItem::new(display)
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, area, &mut app.codex_session_list_state);
+}
+
+fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
+    modified
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| {
+            let secs = d.as_secs();
+            let hours_ago = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|n| n.as_secs())
+                .unwrap_or(secs) - secs) / 3600;
+            if hours_ago < 24 {
+                format!("{}h ago", hours_ago)
+            } else {
+                format!("{}d ago", hours_ago / 24)
+            }
+        })
+        .unwrap_or_default()
 }
 
 fn render_session_viewer(frame: &mut Frame, app: &mut App) {
