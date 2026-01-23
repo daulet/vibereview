@@ -2,7 +2,9 @@ mod claude;
 mod codex;
 mod models;
 
+use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 
 use color_eyre::Result;
 use crossterm::{
@@ -19,12 +21,12 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use claude::{list_projects, list_sessions, parse_session, ProjectInfo, SessionInfo};
-use codex::{list_codex_sessions, parse_codex_session, CodexSessionInfo};
+use claude::{list_projects, list_sessions, parse_session};
+use codex::{list_codex_projects, list_codex_sessions_for_project, parse_codex_session};
 use models::{Session, ToolInvocation, ToolType, Turn};
 
 // =============================================================================
-// App State
+// Unified Types
 // =============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,11 +35,126 @@ pub enum Source {
     Codex,
 }
 
+
+/// A unified project combining sessions from multiple sources.
+#[derive(Debug, Clone)]
+pub struct UnifiedProject {
+    pub path: PathBuf,
+    pub name: String,
+    pub claude_session_count: usize,
+    pub codex_session_count: usize,
+}
+
+
+/// A unified session that can come from either source.
+#[derive(Debug, Clone)]
+pub struct UnifiedSession {
+    pub source: Source,
+    pub path: PathBuf,
+    pub name: String,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+// =============================================================================
+// Unified Listing Functions
+// =============================================================================
+
+/// List all projects from both Claude and Codex, merged by normalized path.
+fn list_unified_projects() -> Vec<UnifiedProject> {
+    let mut project_map: HashMap<PathBuf, UnifiedProject> = HashMap::new();
+
+    // Add Claude projects
+    for claude_project in list_projects() {
+        let path = PathBuf::from(&claude_project.decoded_path);
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        project_map
+            .entry(path.clone())
+            .and_modify(|p| p.claude_session_count += 1)
+            .or_insert(UnifiedProject {
+                path,
+                name,
+                claude_session_count: 1,
+                codex_session_count: 0,
+            });
+    }
+
+    // Count Claude sessions per project
+    for (path, project) in project_map.iter_mut() {
+        // Find the matching Claude project to get actual session count
+        for claude_project in list_projects() {
+            if PathBuf::from(&claude_project.decoded_path) == *path {
+                project.claude_session_count = list_sessions(&claude_project.path).len();
+                break;
+            }
+        }
+    }
+
+    // Add Codex projects
+    for codex_project in list_codex_projects() {
+        let name = codex_project.name.clone();
+        project_map
+            .entry(codex_project.path.clone())
+            .and_modify(|p| p.codex_session_count = codex_project.session_count)
+            .or_insert(UnifiedProject {
+                path: codex_project.path,
+                name,
+                claude_session_count: 0,
+                codex_session_count: codex_project.session_count,
+            });
+    }
+
+    let mut projects: Vec<UnifiedProject> = project_map.into_values().collect();
+    projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    projects
+}
+
+/// List all sessions for a project from both sources.
+fn list_unified_sessions(project: &UnifiedProject) -> Vec<UnifiedSession> {
+    let mut sessions = Vec::new();
+
+    // Add Claude sessions
+    for claude_project in list_projects() {
+        if PathBuf::from(&claude_project.decoded_path) == project.path {
+            for session in list_sessions(&claude_project.path) {
+                sessions.push(UnifiedSession {
+                    source: Source::Claude,
+                    path: session.path,
+                    name: session.name,
+                    modified: session.modified,
+                });
+            }
+            break;
+        }
+    }
+
+    // Add Codex sessions
+    for session in list_codex_sessions_for_project(&project.path) {
+        sessions.push(UnifiedSession {
+            source: Source::Codex,
+            path: session.path,
+            name: session.name,
+            modified: session.modified,
+        });
+    }
+
+    // Sort by modification time, newest first
+    sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions
+}
+
+// =============================================================================
+// App State
+// =============================================================================
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
-    SourceSelector,
-    ProjectBrowser,    // Claude only
-    SessionBrowser,    // Both (Claude after project, Codex directly)
+    ProjectBrowser,
+    SessionBrowser,
     SessionViewer,
 }
 
@@ -117,18 +234,13 @@ impl TurnContext {
 
 pub struct App {
     pub view: View,
-    pub source: Source,
-    pub source_list_state: ListState,
-    // Claude state
-    pub projects: Vec<ProjectInfo>,
-    pub sessions: Vec<SessionInfo>,
-    pub selected_project: Option<ProjectInfo>,
+    // Unified project/session state
+    pub projects: Vec<UnifiedProject>,
+    pub sessions: Vec<UnifiedSession>,
+    pub selected_project: Option<UnifiedProject>,
     pub project_list_state: ListState,
     pub session_list_state: ListState,
-    // Codex state
-    pub codex_sessions: Vec<CodexSessionInfo>,
-    pub codex_session_list_state: ListState,
-    // Common state
+    // Parsed session state
     pub session: Option<Session>,
     /// Stack of turn contexts (main session at bottom, subagents pushed on top)
     pub context_stack: Vec<TurnContext>,
@@ -138,20 +250,19 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let mut source_list_state = ListState::default();
-        source_list_state.select(Some(0));
+        let projects = list_unified_projects();
+        let mut project_list_state = ListState::default();
+        if !projects.is_empty() {
+            project_list_state.select(Some(0));
+        }
 
         Self {
-            view: View::SourceSelector,
-            source: Source::Claude,
-            source_list_state,
-            projects: Vec::new(),
+            view: View::ProjectBrowser,
+            projects,
             sessions: Vec::new(),
             selected_project: None,
-            project_list_state: ListState::default(),
+            project_list_state,
             session_list_state: ListState::default(),
-            codex_sessions: Vec::new(),
-            codex_session_list_state: ListState::default(),
             session: None,
             context_stack: Vec::new(),
             should_quit: false,
@@ -209,60 +320,22 @@ impl App {
         self.error_message = None;
 
         match self.view {
-            View::SourceSelector => self.handle_source_selector_key(key),
             View::ProjectBrowser => self.handle_project_browser_key(key),
             View::SessionBrowser => self.handle_session_browser_key(key),
             View::SessionViewer => self.handle_session_viewer_key(key),
         }
     }
 
-    fn handle_source_selector_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Up => Self::select_prev_in_list(&mut self.source_list_state, 2),
-            KeyCode::Down => Self::select_next_in_list(&mut self.source_list_state, 2),
-            KeyCode::Enter => {
-                match self.source_list_state.selected() {
-                    Some(0) => {
-                        // Claude Code
-                        self.source = Source::Claude;
-                        self.projects = list_projects();
-                        self.project_list_state = ListState::default();
-                        if !self.projects.is_empty() {
-                            self.project_list_state.select(Some(0));
-                        }
-                        self.view = View::ProjectBrowser;
-                    }
-                    Some(1) => {
-                        // Codex
-                        self.source = Source::Codex;
-                        self.codex_sessions = list_codex_sessions();
-                        self.codex_session_list_state = ListState::default();
-                        if !self.codex_sessions.is_empty() {
-                            self.codex_session_list_state.select(Some(0));
-                        }
-                        self.view = View::SessionBrowser;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn handle_project_browser_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
-                self.view = View::SourceSelector;
-            }
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Up => Self::select_prev_in_list(&mut self.project_list_state, self.projects.len()),
             KeyCode::Down => Self::select_next_in_list(&mut self.project_list_state, self.projects.len()),
             KeyCode::Enter => {
                 if let Some(i) = self.project_list_state.selected() {
                     if let Some(project) = self.projects.get(i) {
                         self.selected_project = Some(project.clone());
-                        self.sessions = list_sessions(&project.path);
+                        self.sessions = list_unified_sessions(project);
                         self.session_list_state = ListState::default();
                         if !self.sessions.is_empty() {
                             self.session_list_state.select(Some(0));
@@ -276,13 +349,6 @@ impl App {
     }
 
     fn handle_session_browser_key(&mut self, key: KeyCode) {
-        match self.source {
-            Source::Claude => self.handle_claude_session_browser_key(key),
-            Source::Codex => self.handle_codex_session_browser_key(key),
-        }
-    }
-
-    fn handle_claude_session_browser_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => {
@@ -293,39 +359,11 @@ impl App {
             KeyCode::Enter => {
                 if let Some(i) = self.session_list_state.selected() {
                     if let Some(session_info) = self.sessions.get(i) {
-                        match parse_session(&session_info.path) {
-                            Ok(session) => {
-                                let context = TurnContext::new(
-                                    session.name.clone(),
-                                    session.turns.clone(),
-                                );
-                                self.session = Some(session);
-                                self.context_stack = vec![context];
-                                self.view = View::SessionViewer;
-                            }
-                            Err(e) => {
-                                self.error_message = Some(format!("Failed to parse session: {}", e));
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_codex_session_browser_key(&mut self, key: KeyCode) {
-        match key {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Esc => {
-                self.view = View::SourceSelector;
-            }
-            KeyCode::Up => Self::select_prev_in_list(&mut self.codex_session_list_state, self.codex_sessions.len()),
-            KeyCode::Down => Self::select_next_in_list(&mut self.codex_session_list_state, self.codex_sessions.len()),
-            KeyCode::Enter => {
-                if let Some(i) = self.codex_session_list_state.selected() {
-                    if let Some(session_info) = self.codex_sessions.get(i) {
-                        match parse_codex_session(&session_info.path) {
+                        let result = match session_info.source {
+                            Source::Claude => parse_session(&session_info.path),
+                            Source::Codex => parse_codex_session(&session_info.path),
+                        };
+                        match result {
                             Ok(session) => {
                                 let context = TurnContext::new(
                                     session.name.clone(),
@@ -458,7 +496,6 @@ impl App {
 
 fn ui(frame: &mut Frame, app: &mut App) {
     match app.view {
-        View::SourceSelector => render_source_selector(frame, app),
         View::ProjectBrowser => render_project_browser(frame, app),
         View::SessionBrowser => render_session_browser(frame, app),
         View::SessionViewer => render_session_viewer(frame, app),
@@ -478,44 +515,28 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_source_selector(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
-
-    let items: Vec<ListItem> = vec![
-        ListItem::new("  Claude Code  - ~/.claude/projects/"),
-        ListItem::new("  Codex CLI    - ~/.codex/sessions/"),
-    ];
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Select Source (Enter to open, q to quit) "),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶");
-
-    frame.render_stateful_widget(list, area, &mut app.source_list_state);
-}
-
 fn render_project_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     let items: Vec<ListItem> = app
         .projects
         .iter()
-        .map(|p| ListItem::new(p.decoded_path.clone()))
+        .map(|p| {
+            let counts = match (p.claude_session_count, p.codex_session_count) {
+                (c, 0) => format!("{} Claude", c),
+                (0, x) => format!("{} Codex", x),
+                (c, x) => format!("{} Claude, {} Codex", c, x),
+            };
+            let display = format!("{} ({})", p.name, counts);
+            ListItem::new(display)
+        })
         .collect();
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Select Project (Enter to open, q to quit) "),
+                .title(" Projects (Enter to open, q to quit) "),
         )
         .highlight_style(
             Style::default()
@@ -530,17 +551,10 @@ fn render_project_browser(frame: &mut Frame, app: &mut App) {
 fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    match app.source {
-        Source::Claude => render_claude_session_browser(frame, app, area),
-        Source::Codex => render_codex_session_browser(frame, app, area),
-    }
-}
-
-fn render_claude_session_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = if let Some(p) = &app.selected_project {
-        format!(" Sessions in {} (Esc to go back) ", p.decoded_path)
+        format!(" Sessions in {} (Esc to go back) ", p.name)
     } else {
-        " Sessions ".to_string()
+        " Sessions (Esc to go back) ".to_string()
     };
 
     let items: Vec<ListItem> = app
@@ -548,7 +562,12 @@ fn render_claude_session_browser(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|s| {
             let modified = format_time_ago(s.modified);
-            let display = format!("{} {}", &s.name[..20.min(s.name.len())], modified);
+            let source_tag = match s.source {
+                Source::Claude => "[Claude]",
+                Source::Codex => "[Codex]",
+            };
+            let name_display = truncate_str(&s.name, 30);
+            let display = format!("{} {} {}", source_tag, name_display, modified);
             ListItem::new(display)
         })
         .collect();
@@ -563,32 +582,6 @@ fn render_claude_session_browser(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, area, &mut app.session_list_state);
-}
-
-fn render_codex_session_browser(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = " Codex Sessions (Esc to go back) ";
-
-    let items: Vec<ListItem> = app
-        .codex_sessions
-        .iter()
-        .map(|s| {
-            let modified = format_time_ago(s.modified);
-            let name_display = truncate_str(&s.name, 40);
-            let display = format!("{} {}", name_display, modified);
-            ListItem::new(display)
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-
-    frame.render_stateful_widget(list, area, &mut app.codex_session_list_state);
 }
 
 fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {

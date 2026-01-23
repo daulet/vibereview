@@ -45,6 +45,7 @@ pub fn list_projects() -> Vec<ProjectInfo> {
 
 #[derive(Debug, Clone)]
 pub struct ProjectInfo {
+    #[allow(dead_code)]
     pub name: String,
     pub path: PathBuf,
     pub decoded_path: String,

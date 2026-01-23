@@ -11,21 +11,21 @@ use serde_json::Value;
 
 use crate::models::{Session, SessionSource, ToolInvocation, ToolType, Turn};
 
-/// Information about a Codex project (just a directory path for Codex).
+/// Information about a Codex project (derived from session cwd).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CodexProjectInfo {
     pub path: PathBuf,
     pub name: String,
+    pub session_count: usize,
 }
 
 /// Information about a Codex session file.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CodexSessionInfo {
     pub path: PathBuf,
     pub name: String,
     pub modified: Option<SystemTime>,
+    pub project_path: Option<PathBuf>,
 }
 
 /// List all Codex sessions from ~/.codex/sessions/
@@ -65,14 +65,86 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
             // Only include .json and .jsonl files
             if name.ends_with(".json") || name.ends_with(".jsonl") {
                 let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+                let project_path = extract_session_project_path(&path);
                 sessions.push(CodexSessionInfo {
                     path,
                     name,
                     modified,
+                    project_path,
                 });
             }
         }
     }
+}
+
+/// Extract project path (cwd) from session file without fully parsing it.
+fn extract_session_project_path(path: &Path) -> Option<PathBuf> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    // For JSONL, look for session_meta line
+    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        for line in reader.lines().take(10) {
+            // Only check first 10 lines
+            let line = line.ok()?;
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if value.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+                    return value
+                        .get("payload")
+                        .and_then(|p| p.get("cwd"))
+                        .and_then(|c| c.as_str())
+                        .map(PathBuf::from);
+                }
+            }
+        }
+    }
+    // Old JSON format doesn't have cwd
+    None
+}
+
+/// List Codex projects (unique cwd paths from sessions).
+pub fn list_codex_projects() -> Vec<CodexProjectInfo> {
+    let sessions = list_codex_sessions();
+    let mut project_map: HashMap<PathBuf, usize> = HashMap::new();
+
+    for session in &sessions {
+        if let Some(proj_path) = &session.project_path {
+            *project_map.entry(proj_path.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut projects: Vec<CodexProjectInfo> = project_map
+        .into_iter()
+        .map(|(path, count)| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            CodexProjectInfo {
+                path,
+                name,
+                session_count: count,
+            }
+        })
+        .collect();
+
+    // Sort by name
+    projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    projects
+}
+
+/// List Codex sessions for a specific project path.
+pub fn list_codex_sessions_for_project(project_path: &Path) -> Vec<CodexSessionInfo> {
+    let sessions = list_codex_sessions();
+    let mut filtered: Vec<CodexSessionInfo> = sessions
+        .into_iter()
+        .filter(|s| s.project_path.as_deref() == Some(project_path))
+        .collect();
+
+    // Sort by modification time, newest first
+    filtered.sort_by(|a, b| b.modified.cmp(&a.modified));
+    filtered
 }
 
 /// Parse a Codex session file (supports both JSON and JSONL formats).
