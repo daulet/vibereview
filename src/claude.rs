@@ -74,10 +74,13 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
             let modified = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok();
+            // Extract description (summary or first user message)
+            let description = extract_session_description(&path);
             sessions.push(SessionInfo {
                 name,
                 path,
                 modified,
+                description,
             });
         }
     }
@@ -85,6 +88,46 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     // Sort by modification time, newest first
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     sessions
+}
+
+/// Extract session description from summary or first user message.
+fn extract_session_description(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    let mut first_user_content: Option<String> = None;
+
+    for line in reader.lines().take(100).flatten() {
+        // First, try to find a summary (preferred)
+        if line.contains("\"type\":\"summary\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if let Some(summary) = value.get("summary").and_then(|s| s.as_str()) {
+                    return Some(summary.to_string());
+                }
+            }
+        }
+        // Also capture first real user message as fallback
+        if first_user_content.is_none()
+            && line.contains("\"type\":\"user\"")
+            && !line.contains("\"isMeta\":true")
+            && !line.contains("<local-command")
+        {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if let Some(content) = value
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    // Skip command messages
+                    if !content.starts_with("<command-name>") && !content.starts_with("<local-command") {
+                        first_user_content = Some(content.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    first_user_content
 }
 
 /// Quick check if a session file has actual conversation (not just metadata or local commands).
@@ -108,6 +151,7 @@ pub struct SessionInfo {
     pub name: String,
     pub path: PathBuf,
     pub modified: Option<std::time::SystemTime>,
+    pub description: Option<String>,
 }
 
 /// Parse a Claude Code session file.

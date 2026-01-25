@@ -16,7 +16,6 @@ use crate::models::{Session, SessionSource, ToolInvocation, ToolType, Turn};
 pub struct CodexProjectInfo {
     pub path: PathBuf,
     pub name: String,
-    pub session_count: usize,
 }
 
 /// Information about a Codex session file.
@@ -26,6 +25,7 @@ pub struct CodexSessionInfo {
     pub name: String,
     pub modified: Option<SystemTime>,
     pub project_path: Option<PathBuf>,
+    pub description: Option<String>,
 }
 
 /// List all Codex sessions from ~/.codex/sessions/
@@ -70,15 +70,58 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
                 }
                 let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
                 let project_path = extract_session_project_path(&path);
+                let description = extract_codex_session_description(&path);
                 sessions.push(CodexSessionInfo {
                     path,
                     name,
                     modified,
                     project_path,
+                    description,
                 });
             }
         }
     }
+}
+
+/// Extract description from first user message in Codex session.
+fn extract_codex_session_description(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines().take(50).flatten() {
+        // JSONL format: event_msg with user_message
+        if line.contains("\"user_message\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if let Some(message) = value
+                    .get("payload")
+                    .and_then(|p| p.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    return Some(message.to_string());
+                }
+            }
+        }
+        // JSON format: message with role user and input_text content
+        if line.contains("\"role\":\"user\"") || line.contains("\"role\": \"user\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                // Try content array with input_text
+                if let Some(content) = value.get("content").and_then(|c| c.as_array()) {
+                    for item in content {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("input_text") {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                return Some(text.to_string());
+                            }
+                        }
+                    }
+                }
+                // Try simple string content
+                if let Some(text) = value.get("content").and_then(|c| c.as_str()) {
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Quick check if a Codex session file has actual conversation (not just metadata).
@@ -134,27 +177,23 @@ fn extract_session_project_path(path: &Path) -> Option<PathBuf> {
 /// List Codex projects (unique cwd paths from sessions).
 pub fn list_codex_projects() -> Vec<CodexProjectInfo> {
     let sessions = list_codex_sessions();
-    let mut project_map: HashMap<PathBuf, usize> = HashMap::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for session in &sessions {
         if let Some(proj_path) = &session.project_path {
-            *project_map.entry(proj_path.clone()).or_insert(0) += 1;
+            seen.insert(proj_path.clone());
         }
     }
 
-    let mut projects: Vec<CodexProjectInfo> = project_map
+    let mut projects: Vec<CodexProjectInfo> = seen
         .into_iter()
-        .map(|(path, count)| {
+        .map(|path| {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            CodexProjectInfo {
-                path,
-                name,
-                session_count: count,
-            }
+            CodexProjectInfo { path, name }
         })
         .collect();
 
