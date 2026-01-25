@@ -1,6 +1,7 @@
 mod claude;
 mod codex;
 mod models;
+mod share;
 
 use std::io;
 use std::path::PathBuf;
@@ -34,6 +35,16 @@ pub enum Source {
     Codex,
 }
 
+/// State of the upload operation
+#[derive(Debug, Clone)]
+pub enum UploadState {
+    Idle,
+    Confirming,
+    Compressing,
+    Uploading,
+    Complete { url: String },
+    Error { message: String },
+}
 
 /// A unified session that can come from either source.
 #[derive(Debug, Clone)]
@@ -187,6 +198,8 @@ pub struct App {
     pub context_stack: Vec<TurnContext>,
     pub should_quit: bool,
     pub error_message: Option<String>,
+    /// State of the upload operation
+    pub upload_state: UploadState,
 }
 
 impl App {
@@ -205,6 +218,7 @@ impl App {
             context_stack: Vec::new(),
             should_quit: false,
             error_message: None,
+            upload_state: UploadState::Idle,
         }
     }
 
@@ -257,15 +271,114 @@ impl App {
     pub fn handle_key(&mut self, key: KeyCode) {
         self.error_message = None;
 
+        // Handle upload modal first
+        if !matches!(self.upload_state, UploadState::Idle) {
+            self.handle_upload_key(key);
+            return;
+        }
+
         match self.view {
             View::SessionBrowser => self.handle_session_browser_key(key),
             View::SessionViewer => self.handle_session_viewer_key(key),
         }
     }
 
+    fn handle_upload_key(&mut self, key: KeyCode) {
+        match &self.upload_state {
+            UploadState::Confirming => {
+                match key {
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        // Start upload
+                        self.perform_upload();
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        self.upload_state = UploadState::Idle;
+                    }
+                    _ => {}
+                }
+            }
+            UploadState::Complete { .. } | UploadState::Error { .. } => {
+                // Any key dismisses the result
+                self.upload_state = UploadState::Idle;
+            }
+            _ => {}
+        }
+    }
+
+    fn perform_upload(&mut self) {
+        let session = match &self.session {
+            Some(s) => s.clone(),
+            None => {
+                // Try to load from selected session in browser
+                if let Some(i) = self.session_list_state.selected() {
+                    if let Some(session_info) = self.sessions.get(i) {
+                        let result = match session_info.source {
+                            Source::Claude => parse_session(&session_info.path),
+                            Source::Codex => parse_codex_session(&session_info.path),
+                        };
+                        match result {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.upload_state = UploadState::Error {
+                                    message: format!("Failed to parse session: {}", e),
+                                };
+                                return;
+                            }
+                        }
+                    } else {
+                        self.upload_state = UploadState::Error {
+                            message: "No session selected".to_string(),
+                        };
+                        return;
+                    }
+                } else {
+                    self.upload_state = UploadState::Error {
+                        message: "No session selected".to_string(),
+                    };
+                    return;
+                }
+            }
+        };
+
+        self.upload_state = UploadState::Compressing;
+
+        // Compress the session
+        let compressed = match share::compress_session(&session) {
+            Ok(c) => c,
+            Err(e) => {
+                self.upload_state = UploadState::Error {
+                    message: format!("Compression failed: {}", e),
+                };
+                return;
+            }
+        };
+
+        self.upload_state = UploadState::Uploading;
+
+        // Upload to server
+        match share::upload_session(&compressed) {
+            Ok(response) => {
+                // Try to copy URL to clipboard
+                let _ = share::copy_to_clipboard(&response.url);
+                self.upload_state = UploadState::Complete { url: response.url };
+            }
+            Err(e) => {
+                self.upload_state = UploadState::Error {
+                    message: format!("Upload failed: {}", e),
+                };
+            }
+        }
+    }
+
     fn handle_session_browser_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('u') => {
+                // Upload selected session
+                if self.session_list_state.selected().is_some() {
+                    self.upload_state = UploadState::Confirming;
+                }
+            }
             KeyCode::Up => Self::select_prev_in_list(&mut self.session_list_state, self.sessions.len()),
             KeyCode::Down => Self::select_next_in_list(&mut self.session_list_state, self.sessions.len()),
             KeyCode::Enter => {
@@ -299,6 +412,12 @@ impl App {
     fn handle_session_viewer_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('S') => {
+                // Share current session
+                if self.session.is_some() {
+                    self.upload_state = UploadState::Confirming;
+                }
+            }
             KeyCode::Esc => {
                 // Pop subagent context or go back to session browser
                 if self.context_stack.len() > 1 {
@@ -424,6 +543,96 @@ fn ui(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
         frame.render_widget(error_msg, error_area);
     }
+
+    // Render upload modal if active
+    if !matches!(app.upload_state, UploadState::Idle) {
+        render_upload_modal(frame, app);
+    }
+}
+
+fn render_upload_modal(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
+    // Create centered modal area
+    let modal_width = 60.min(area.width.saturating_sub(4));
+    let modal_height = 10.min(area.height.saturating_sub(4));
+    let modal_area = Rect {
+        x: (area.width - modal_width) / 2,
+        y: (area.height - modal_height) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Clear background
+    frame.render_widget(Clear, modal_area);
+
+    let (title, content, style) = match &app.upload_state {
+        UploadState::Idle => return,
+        UploadState::Confirming => {
+            let session_name = app.session.as_ref()
+                .map(|s| s.name.clone())
+                .or_else(|| {
+                    app.session_list_state.selected()
+                        .and_then(|i| app.sessions.get(i))
+                        .map(|s| s.name.clone())
+                })
+                .unwrap_or_else(|| "Unknown".to_string());
+            (
+                " Share Session ",
+                format!(
+                    "Share \"{}\"?\n\n\
+                    This will upload the session to the cloud and\n\
+                    create a shareable link.\n\n\
+                    Press Enter or 'y' to confirm, Esc or 'n' to cancel",
+                    truncate_str(&session_name, 30)
+                ),
+                Style::default().fg(Color::Yellow),
+            )
+        }
+        UploadState::Compressing => (
+            " Sharing... ",
+            "Compressing session...".to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        UploadState::Uploading => (
+            " Sharing... ",
+            "Uploading to cloud...".to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        UploadState::Complete { url } => (
+            " Share Complete ",
+            format!(
+                "Session shared successfully!\n\n\
+                URL: {}\n\n\
+                (Copied to clipboard)\n\n\
+                Press any key to close",
+                url
+            ),
+            Style::default().fg(Color::Green),
+        ),
+        UploadState::Error { message } => (
+            " Share Failed ",
+            format!(
+                "Error: {}\n\n\
+                Press any key to close",
+                message
+            ),
+            Style::default().fg(Color::Red),
+        ),
+    };
+
+    let modal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(style)
+                .title(title)
+                .title_style(style.add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::White));
+
+    frame.render_widget(modal, modal_area);
 }
 
 fn render_session_browser(frame: &mut Frame, app: &mut App) {
@@ -442,7 +651,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
     // borders(2) + highlight(2) + spacing(4 separators * 2 = 8) = 12
     let desc_width = (area.width as usize).saturating_sub(12 + id_width + time_width + source_width + project_width).max(10);
 
-    let title = format!(" Sessions ({}) - Enter to open, q to quit ", app.sessions.len());
+    let title = format!(" Sessions ({}) - Enter: open | u: share | q: quit ", app.sessions.len());
 
     // Render header line and list
     let chunks = Layout::default()
@@ -657,9 +866,9 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
 
     // Help line
     let help_text = if app.is_subagent_view() {
-        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open | Esc: Back | q: Quit "
+        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open | S: Share | Esc: Back | q: Quit "
     } else {
-        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open subagent | Esc: Back | q: Quit "
+        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open subagent | S: Share | Esc: Back | q: Quit "
     };
     let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, help_area);

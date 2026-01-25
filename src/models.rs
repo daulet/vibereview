@@ -1,10 +1,11 @@
 //! Generic data models for session transcripts.
 //! Designed to support multiple sources (Claude Code, other LLM tools, etc.)
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// A session contains metadata and a list of conversation turns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub name: String,
@@ -14,14 +15,14 @@ pub struct Session {
 }
 
 /// Where this session originated from.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionSource {
     ClaudeCode { version: Option<String> },
     Other { name: String },
 }
 
 /// A single turn in the conversation (user prompt + model response).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Turn {
     pub id: String,
     pub timestamp: Option<String>,
@@ -33,7 +34,7 @@ pub struct Turn {
 }
 
 /// A tool invocation with its input, output, and type information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInvocation {
     pub id: String,
     pub tool_type: ToolType,
@@ -44,7 +45,7 @@ pub struct ToolInvocation {
 }
 
 /// Categorized tool types for rendering purposes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolType {
     FileRead {
         path: String,
@@ -94,7 +95,7 @@ pub enum ToolType {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
     pub content: String,
     pub status: String,
