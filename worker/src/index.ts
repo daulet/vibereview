@@ -242,19 +242,24 @@ function generateViewerHtml(sessionId: string): string {
     .container {
       display: flex;
       height: 100vh;
+      width: 100vw;
+      overflow: hidden;
     }
 
     .turn-list {
       width: 30%;
       min-width: 250px;
       max-width: 400px;
+      flex-shrink: 0;
       border-right: 1px solid var(--border-color);
       display: flex;
       flex-direction: column;
+      overflow: hidden;
     }
 
     .turn-list-header {
       padding: 12px;
+      flex-shrink: 0;
       border-bottom: 1px solid var(--border-color);
       background: var(--bg-secondary);
     }
@@ -266,6 +271,7 @@ function generateViewerHtml(sessionId: string): string {
 
     .turn-list-items {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
     }
 
@@ -310,6 +316,7 @@ function generateViewerHtml(sessionId: string): string {
 
     .detail-panel {
       flex: 1;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       overflow: hidden;
@@ -317,6 +324,7 @@ function generateViewerHtml(sessionId: string): string {
 
     .breadcrumb {
       padding: 8px 12px;
+      flex-shrink: 0;
       background: var(--bg-secondary);
       color: var(--accent-cyan);
       font-size: 12px;
@@ -329,6 +337,7 @@ function generateViewerHtml(sessionId: string): string {
 
     .tabs {
       display: flex;
+      flex-shrink: 0;
       border-bottom: 1px solid var(--border-color);
       background: var(--bg-secondary);
     }
@@ -354,7 +363,9 @@ function generateViewerHtml(sessionId: string): string {
 
     .content {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
+      overflow-x: hidden;
       padding: 16px;
     }
 
@@ -386,6 +397,8 @@ function generateViewerHtml(sessionId: string): string {
 
     pre {
       white-space: pre-wrap;
+      overflow-wrap: break-word;
+      max-width: 100%;
       word-break: break-word;
     }
 
@@ -501,6 +514,7 @@ function generateViewerHtml(sessionId: string): string {
 
     .help-bar {
       padding: 8px 12px;
+      flex-shrink: 0;
       background: var(--bg-secondary);
       border-top: 1px solid var(--border-color);
       color: var(--text-muted);
