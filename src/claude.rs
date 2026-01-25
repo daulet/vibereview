@@ -51,7 +51,7 @@ pub struct ProjectInfo {
     pub decoded_path: String,
 }
 
-/// List sessions in a project (excludes agent-* files which are embedded in parent sessions).
+/// List sessions in a project (excludes agent-* files and empty sessions).
 pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     let Ok(entries) = fs::read_dir(project_path) else {
         return Vec::new();
@@ -64,6 +64,10 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
             let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
             // Skip agent files - they'll be embedded in parent sessions
             if name.starts_with("agent-") {
+                continue;
+            }
+            // Skip empty sessions (no actual user messages)
+            if !session_has_messages(&path) {
                 continue;
             }
             // Get file metadata for sorting by modification time
@@ -81,6 +85,22 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     // Sort by modification time, newest first
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     sessions
+}
+
+/// Quick check if a session file has actual conversation (not just metadata or local commands).
+fn session_has_messages(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let reader = BufReader::new(file);
+
+    // A real conversation has assistant responses - check for those
+    for line in reader.lines().take(200).flatten() {
+        if line.contains("\"type\":\"assistant\"") || line.contains("\"type\": \"assistant\"") {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone)]

@@ -62,8 +62,12 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
                 .unwrap_or("")
                 .to_string();
 
-            // Only include .json and .jsonl files
+            // Only include .json and .jsonl files that have actual content
             if name.ends_with(".json") || name.ends_with(".jsonl") {
+                // Skip empty sessions (no actual user messages)
+                if !codex_session_has_messages(&path) {
+                    continue;
+                }
                 let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
                 let project_path = extract_session_project_path(&path);
                 sessions.push(CodexSessionInfo {
@@ -75,6 +79,31 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
             }
         }
     }
+}
+
+/// Quick check if a Codex session file has actual conversation (not just metadata).
+fn codex_session_has_messages(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let reader = BufReader::new(file);
+
+    // A real conversation has agent/assistant responses - check for those
+    for line in reader.lines().take(100).flatten() {
+        // JSONL format: event_msg with agent_message type
+        if line.contains("\"agent_message\"") {
+            return true;
+        }
+        // JSON format: message with role assistant
+        if line.contains("\"role\":\"assistant\"") || line.contains("\"role\": \"assistant\"") {
+            return true;
+        }
+        // Also check for function calls which indicate actual work
+        if line.contains("\"function_call\"") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extract project path (cwd) from session file without fully parsing it.
