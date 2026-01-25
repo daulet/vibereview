@@ -1,4 +1,4 @@
-# promptui-share Worker
+# VibeReview Worker
 
 Cloudflare Worker for session sharing. Handles upload, storage (R2), and web viewer.
 
@@ -11,7 +11,7 @@ Cloudflare Worker for session sharing. Handles upload, storage (R2), and web vie
 
 2. Create the R2 bucket:
    ```bash
-   wrangler r2 bucket create promptui-sessions
+   wrangler r2 bucket create vibereview-sessions
    ```
 
 3. Deploy:

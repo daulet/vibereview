@@ -1,10 +1,10 @@
-name = "promptui-share"
+name = "vibereview"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
 [[r2_buckets]]
 binding = "SESSIONS"
-bucket_name = "promptui-sessions"
+bucket_name = "vibe-sessions"
 
 [vars]
 CORS_ORIGIN = "*"

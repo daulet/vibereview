@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 /// The base URL for the share service
-const SHARE_API_URL: &str = "https://promptui-share.dzzh.workers.dev/api/sessions";
+/// TODO: Update with your Cloudflare Workers subdomain after first deploy
+const SHARE_API_URL: &str = "https://vibereview.<your-subdomain>.workers.dev/api/sessions";
 
 /// A shared session with metadata for the web viewer.
 #[derive(Debug, Clone, Serialize, Deserialize)]

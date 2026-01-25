@@ -66,7 +66,7 @@ export default {
 
     // Redirect root to GitHub
     if (path === '/') {
-      return Response.redirect('https://github.com/dzhanguzin/promptui', 302);
+      return Response.redirect('https://github.com/dzhanguzin/vibereview', 302);
     }
 
     return new Response('Not Found', { status: 404 });
@@ -207,7 +207,7 @@ function generateViewerHtml(sessionId: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex, nofollow">
-  <title>promptui - Shared Session</title>
+  <title>VibeReview - Shared Session</title>
   <style>
     :root {
       --bg-primary: #1a1a2e;
