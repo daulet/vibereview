@@ -5,10 +5,11 @@ mod share;
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -188,6 +189,64 @@ impl TurnContext {
     }
 }
 
+/// What was copied to clipboard
+#[derive(Debug, Clone)]
+pub enum CopySource {
+    Tab(String),      // Tab name: "Prompt", "Thinking", "Tool Calls", "Diff"
+    Prompt,
+    Response,
+    Selection,
+}
+
+impl std::fmt::Display for CopySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CopySource::Tab(name) => write!(f, "{}", name),
+            CopySource::Prompt => write!(f, "prompt"),
+            CopySource::Response => write!(f, "response"),
+            CopySource::Selection => write!(f, "selection"),
+        }
+    }
+}
+
+/// Copy feedback state
+#[derive(Debug, Clone)]
+pub struct CopyFeedback {
+    pub timestamp: Instant,
+    pub source: CopySource,
+}
+
+/// Text selection state for mouse-based selection
+#[derive(Debug, Clone)]
+pub struct TextSelection {
+    /// Start position (row, col) relative to content area
+    pub start: (u16, u16),
+    /// End position (row, col) relative to content area
+    pub end: (u16, u16),
+    /// Whether selection is in progress (mouse is held down)
+    pub selecting: bool,
+}
+
+impl TextSelection {
+    fn new(row: u16, col: u16) -> Self {
+        Self {
+            start: (row, col),
+            end: (row, col),
+            selecting: true,
+        }
+    }
+
+    /// Get normalized selection (start <= end)
+    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+        if self.start.0 < self.end.0 || (self.start.0 == self.end.0 && self.start.1 <= self.end.1) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+}
+
 pub struct App {
     pub view: View,
     pub sessions: Vec<UnifiedSession>,
@@ -200,6 +259,14 @@ pub struct App {
     pub error_message: Option<String>,
     /// State of the upload operation
     pub upload_state: UploadState,
+    /// Copy feedback with source info (clears after 1.5s)
+    pub copy_feedback: Option<CopyFeedback>,
+    /// Current text selection state
+    pub text_selection: Option<TextSelection>,
+    /// Content area rect (set during render for mouse hit testing)
+    pub content_area: Option<Rect>,
+    /// Content lines for text extraction (set during render)
+    pub content_lines: Vec<String>,
 }
 
 impl App {
@@ -219,6 +286,10 @@ impl App {
             should_quit: false,
             error_message: None,
             upload_state: UploadState::Idle,
+            copy_feedback: None,
+            text_selection: None,
+            content_area: None,
+            content_lines: Vec::new(),
         }
     }
 
@@ -494,6 +565,22 @@ impl App {
                 // Try to open subagent if on Tool Calls tab and tool is openable
                 self.try_open_subagent();
             }
+            KeyCode::Char('c') => {
+                // Copy current tab content
+                let tab_name = self.current_tab_name();
+                let content = self.get_copyable_content();
+                self.copy_to_clipboard(content, CopySource::Tab(tab_name));
+            }
+            KeyCode::Char('p') => {
+                // Copy user prompt only
+                let content = self.get_prompt_text();
+                self.copy_to_clipboard(content, CopySource::Prompt);
+            }
+            KeyCode::Char('r') => {
+                // Copy response only
+                let content = self.get_response_text();
+                self.copy_to_clipboard(content, CopySource::Response);
+            }
             _ => {}
         }
     }
@@ -518,6 +605,193 @@ impl App {
             let context = TurnContext::new(title, turns);
             self.context_stack.push(context);
         }
+    }
+
+    /// Get the copyable text for the current tab
+    fn get_copyable_content(&self) -> Option<String> {
+        let ctx = self.current_context()?;
+        let turn = ctx.selected_turn()?;
+
+        match ctx.active_tab {
+            DetailTab::Prompt => {
+                let mut content = turn.user_prompt.clone();
+                if !turn.response.is_empty() {
+                    content.push_str("\n\n---\n\n");
+                    content.push_str(&turn.response);
+                }
+                Some(content)
+            }
+            DetailTab::Thinking => turn.thinking.clone(),
+            DetailTab::ToolCalls => {
+                ctx.selected_tool().map(|tool| {
+                    format!(
+                        "Tool: {}\n\nInput:\n{}\n\nOutput:\n{}",
+                        tool.tool_type.name(),
+                        tool.input_display,
+                        tool.output_display
+                    )
+                })
+            }
+            DetailTab::Diff => {
+                let mut diffs = String::new();
+                for tool in &turn.tool_invocations {
+                    if let Some(diff) = tool.tool_type.diff() {
+                        let path = match &tool.tool_type {
+                            ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+                            _ => "unknown".to_string(),
+                        };
+                        diffs.push_str(&format!("--- {} ---\n{}\n\n", path, diff));
+                    }
+                }
+                if diffs.is_empty() {
+                    None
+                } else {
+                    Some(diffs)
+                }
+            }
+        }
+    }
+
+    /// Get just the user prompt text
+    fn get_prompt_text(&self) -> Option<String> {
+        self.current_context()
+            .and_then(|ctx| ctx.selected_turn())
+            .map(|turn| turn.user_prompt.clone())
+    }
+
+    /// Get just the response text
+    fn get_response_text(&self) -> Option<String> {
+        self.current_context()
+            .and_then(|ctx| ctx.selected_turn())
+            .filter(|turn| !turn.response.is_empty())
+            .map(|turn| turn.response.clone())
+    }
+
+    /// Get the current tab name
+    fn current_tab_name(&self) -> String {
+        self.current_context()
+            .map(|ctx| match ctx.active_tab {
+                DetailTab::Prompt => "Prompt",
+                DetailTab::Thinking => "Thinking",
+                DetailTab::ToolCalls => "Tool Calls",
+                DetailTab::Diff => "Diff",
+            })
+            .unwrap_or("content")
+            .to_string()
+    }
+
+    /// Copy text to clipboard and show feedback
+    fn copy_to_clipboard(&mut self, text: Option<String>, source: CopySource) {
+        if let Some(text) = text {
+            if share::copy_to_clipboard(&text).is_ok() {
+                self.copy_feedback = Some(CopyFeedback {
+                    timestamp: Instant::now(),
+                    source,
+                });
+            }
+        }
+    }
+
+    /// Handle mouse events for text selection
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Only handle mouse in session viewer with content
+        if self.view != View::SessionViewer {
+            return;
+        }
+
+        let Some(content_area) = self.content_area else {
+            return;
+        };
+
+        let x = mouse.column;
+        let y = mouse.row;
+
+        // Check if mouse is within content area
+        let in_content = x >= content_area.x
+            && x < content_area.x + content_area.width
+            && y >= content_area.y
+            && y < content_area.y + content_area.height;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_content {
+                    // Start selection - position relative to content area
+                    let rel_x = x.saturating_sub(content_area.x);
+                    let rel_y = y.saturating_sub(content_area.y);
+                    self.text_selection = Some(TextSelection::new(rel_y, rel_x));
+                } else {
+                    self.text_selection = None;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(ref mut selection) = self.text_selection {
+                    // Update selection end - clamp to content area
+                    let rel_x = x.saturating_sub(content_area.x).min(content_area.width.saturating_sub(1));
+                    let rel_y = y.saturating_sub(content_area.y).min(content_area.height.saturating_sub(1));
+                    selection.end = (rel_y, rel_x);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(ref mut selection) = self.text_selection {
+                    selection.selecting = false;
+                    // Extract and copy selected text
+                    let selected_text = self.extract_selected_text();
+                    if let Some(text) = selected_text {
+                        if !text.is_empty() {
+                            let _ = share::copy_to_clipboard(&text);
+                            self.copy_feedback = Some(CopyFeedback {
+                                timestamp: Instant::now(),
+                                source: CopySource::Selection,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract selected text from content_lines based on current selection
+    fn extract_selected_text(&self) -> Option<String> {
+        let selection = self.text_selection.as_ref()?;
+        let ctx = self.current_context()?;
+
+        if self.content_lines.is_empty() {
+            return None;
+        }
+
+        let ((start_row, start_col), (end_row, end_col)) = selection.normalized();
+        let scroll = ctx.scroll_offset as usize;
+
+        let mut result = String::new();
+
+        for (i, rel_row) in (start_row..=end_row).enumerate() {
+            let line_idx = scroll + rel_row as usize;
+            if line_idx >= self.content_lines.len() {
+                break;
+            }
+
+            let line = &self.content_lines[line_idx];
+            let chars: Vec<char> = line.chars().collect();
+
+            let line_start = if rel_row == start_row { start_col as usize } else { 0 };
+            let line_end = if rel_row == end_row {
+                (end_col as usize + 1).min(chars.len())
+            } else {
+                chars.len()
+            };
+
+            if line_start < chars.len() {
+                let selected: String = chars[line_start..line_end.min(chars.len())].iter().collect();
+                result.push_str(&selected);
+            }
+
+            if i < (end_row - start_row) as usize {
+                result.push('\n');
+            }
+        }
+
+        Some(result)
     }
 }
 
@@ -794,7 +1068,7 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut ctx.turn_list_state);
 }
 
-fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
+fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -844,6 +1118,14 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, content_area);
     let content_block = Block::default().borders(Borders::ALL);
 
+    // Store the inner content area (excluding 1-char border on each side)
+    let inner_content_area = Rect {
+        x: content_area.x + 1,
+        y: content_area.y + 1,
+        width: content_area.width.saturating_sub(2),
+        height: content_area.height.saturating_sub(2),
+    };
+
     if let Some(turn) = ctx.selected_turn() {
         let content: Text = match ctx.active_tab {
             DetailTab::Prompt => render_prompt_tab(turn),
@@ -852,26 +1134,129 @@ fn render_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
             DetailTab::Diff => render_diff_tab(turn),
         };
 
+        // Extract plain text lines for selection
+        let content_lines: Vec<String> = content.lines.iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+
+        // Apply selection highlighting if active
+        let content = apply_selection_highlight(content, &app.text_selection, ctx.scroll_offset, inner_content_area.width);
+
         let paragraph = Paragraph::new(content)
             .block(content_block)
             .wrap(Wrap { trim: false })
             .scroll((ctx.scroll_offset, 0));
         frame.render_widget(paragraph, content_area);
+
+        // Store for mouse handling (after we're done with ctx borrow)
+        app.content_area = Some(inner_content_area);
+        app.content_lines = content_lines;
     } else {
         let paragraph = Paragraph::new("Select a turn to view details")
             .block(content_block)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(paragraph, content_area);
+        app.content_area = None;
+        app.content_lines.clear();
     }
 
-    // Help line
-    let help_text = if app.is_subagent_view() {
-        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open | S: Share | Esc: Back | q: Quit "
+    // Help line - show "Copied!" feedback briefly, otherwise show help
+    let copy_feedback = app.copy_feedback.as_ref()
+        .filter(|f| f.timestamp.elapsed().as_millis() < 1500);
+
+    let (help_text, help_style) = if let Some(feedback) = copy_feedback {
+        (
+            format!(" ✓ Copied {} to clipboard! ", feedback.source),
+            Style::default().fg(Color::Green),
+        )
+    } else if app.is_subagent_view() {
+        (
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | Mouse: Select | Esc: Back | q: Quit ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
     } else {
-        " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | Enter: Open subagent | S: Share | Esc: Back | q: Quit "
+        (
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | Mouse: Select | Enter: Open | q: Quit ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
     };
-    let help = Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray));
+
+    let help = Paragraph::new(help_text).style(help_style);
     frame.render_widget(help, help_area);
+}
+
+/// Apply selection highlighting to text content
+fn apply_selection_highlight(content: Text<'static>, selection: &Option<TextSelection>, scroll_offset: u16, _width: u16) -> Text<'static> {
+    let Some(sel) = selection else {
+        return content;
+    };
+
+    let ((start_row, start_col), (end_row, end_col)) = sel.normalized();
+
+    // Convert selection coordinates (relative to visible area) to content line indices
+    let sel_start_line = scroll_offset as usize + start_row as usize;
+    let sel_end_line = scroll_offset as usize + end_row as usize;
+
+    let highlight_style = Style::default().bg(Color::Blue).fg(Color::White);
+
+    let mut new_lines: Vec<Line<'static>> = Vec::new();
+
+    for (line_idx, line) in content.lines.into_iter().enumerate() {
+        if line_idx < sel_start_line || line_idx > sel_end_line {
+            // Line not in selection
+            new_lines.push(line);
+            continue;
+        }
+
+        // This line is (partially) selected
+        let mut new_spans: Vec<Span<'static>> = Vec::new();
+        let mut current_col: usize = 0;
+
+        for span in line.spans {
+            let span_text: String = span.content.to_string();
+            let span_len = span_text.chars().count();
+            let span_end_col = current_col + span_len;
+
+            // Determine selection range within this line
+            let line_sel_start = if line_idx == sel_start_line { start_col as usize } else { 0 };
+            let line_sel_end = if line_idx == sel_end_line { end_col as usize + 1 } else { usize::MAX };
+
+            // Check if this span overlaps with selection
+            if span_end_col <= line_sel_start || current_col >= line_sel_end {
+                // Span is outside selection
+                new_spans.push(Span::styled(span_text, span.style));
+            } else {
+                // Span overlaps with selection - split it
+                let chars: Vec<char> = span_text.chars().collect();
+
+                // Part before selection
+                if current_col < line_sel_start {
+                    let before: String = chars[..line_sel_start - current_col].iter().collect();
+                    new_spans.push(Span::styled(before, span.style));
+                }
+
+                // Selected part
+                let sel_start_in_span = line_sel_start.saturating_sub(current_col);
+                let sel_end_in_span = (line_sel_end - current_col).min(span_len);
+                if sel_start_in_span < span_len {
+                    let selected: String = chars[sel_start_in_span..sel_end_in_span].iter().collect();
+                    new_spans.push(Span::styled(selected, highlight_style));
+                }
+
+                // Part after selection
+                if line_sel_end < span_end_col {
+                    let after: String = chars[line_sel_end - current_col..].iter().collect();
+                    new_spans.push(Span::styled(after, span.style));
+                }
+            }
+
+            current_col = span_end_col;
+        }
+
+        new_lines.push(Line::from(new_spans));
+    }
+
+    Text::from(new_lines)
 }
 
 /// Truncate a string to max_chars, adding "…" if truncated
@@ -1131,6 +1516,7 @@ fn main() -> Result<()> {
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
+    io::stdout().execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
     let mut app = App::new();
@@ -1139,14 +1525,21 @@ fn main() -> Result<()> {
         terminal.draw(|frame| ui(frame, &mut app))?;
 
         if event::poll(std::time::Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code);
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        app.handle_key(key.code);
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                }
+                _ => {}
             }
         }
     }
 
+    io::stdout().execute(DisableMouseCapture)?;
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
 
