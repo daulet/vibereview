@@ -543,6 +543,104 @@ function generateViewerHtml(sessionId: string): string {
       font-style: italic;
       margin-top: 12px;
     }
+
+    /* Markdown styles */
+    .markdown-content h1,
+    .markdown-content h2,
+    .markdown-content h3,
+    .markdown-content h4 {
+      color: var(--accent-cyan);
+      margin-top: 16px;
+      margin-bottom: 8px;
+    }
+
+    .markdown-content h1 { font-size: 1.4em; }
+    .markdown-content h2 { font-size: 1.2em; }
+    .markdown-content h3 { font-size: 1.1em; }
+
+    .markdown-content p {
+      margin-bottom: 12px;
+    }
+
+    .markdown-content code {
+      background: #2a2a3e;
+      color: var(--accent-green);
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: inherit;
+    }
+
+    .markdown-content pre {
+      background: #2a2a3e;
+      padding: 12px;
+      border-radius: 4px;
+      overflow-x: auto;
+      margin: 12px 0;
+    }
+
+    .markdown-content pre code {
+      background: transparent;
+      padding: 0;
+      color: var(--text-primary);
+    }
+
+    .markdown-content ul,
+    .markdown-content ol {
+      margin-left: 20px;
+      margin-bottom: 12px;
+    }
+
+    .markdown-content li {
+      margin-bottom: 4px;
+    }
+
+    .markdown-content blockquote {
+      border-left: 3px solid var(--accent-cyan);
+      margin: 12px 0;
+      padding-left: 12px;
+      color: var(--text-secondary);
+    }
+
+    .markdown-content a {
+      color: var(--accent-cyan);
+      text-decoration: none;
+    }
+
+    .markdown-content a:hover {
+      text-decoration: underline;
+    }
+
+    .markdown-content strong {
+      color: var(--accent-yellow);
+    }
+
+    .markdown-content em {
+      color: var(--accent-magenta);
+    }
+
+    .markdown-content hr {
+      border: none;
+      border-top: 1px solid var(--border-color);
+      margin: 16px 0;
+    }
+
+    .markdown-content table {
+      border-collapse: collapse;
+      margin: 12px 0;
+      width: 100%;
+    }
+
+    .markdown-content th,
+    .markdown-content td {
+      border: 1px solid var(--border-color);
+      padding: 8px;
+      text-align: left;
+    }
+
+    .markdown-content th {
+      background: var(--bg-secondary);
+      color: var(--accent-cyan);
+    }
   </style>
 </head>
 <body>
@@ -550,6 +648,13 @@ function generateViewerHtml(sessionId: string): string {
 
   <script type="module">
     import { decompress } from 'https://esm.sh/fzstd@0.1.1';
+    import { marked } from 'https://esm.sh/marked@15.0.0';
+
+    // Configure marked for safe output (no raw HTML pass-through)
+    marked.setOptions({
+      gfm: true,
+      breaks: true,
+    });
 
     const SESSION_ID = '${sessionId}';
     const API_URL = '/api/sessions/' + SESSION_ID;
@@ -681,7 +786,7 @@ function generateViewerHtml(sessionId: string): string {
         \${turn.response ? \`
           <div class="divider">\${'\\u2500'.repeat(40)}</div>
           <div class="response-header">Response:</div>
-          <pre>\${escapeHtml(turn.response)}</pre>
+          <div class="markdown-content">\${marked.parse(turn.response)}</div>
         \` : ''}
       \`;
     }
@@ -692,7 +797,7 @@ function generateViewerHtml(sessionId: string): string {
       }
       return \`
         <div class="section-header magenta">Model Thinking:</div>
-        <pre>\${escapeHtml(turn.thinking)}</pre>
+        <div class="markdown-content">\${marked.parse(turn.thinking)}</div>
       \`;
     }
 

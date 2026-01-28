@@ -13,6 +13,7 @@
     "wrangler": "^4.60.0"
   },
   "dependencies": {
-    "nanoid": "^5.0.9"
+    "nanoid": "^5.0.9",
+    "marked": "^15.0.0"
   }
 }

@@ -21,6 +21,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
+use pulldown_cmark::{Event as MdEvent, Parser, Tag, TagEnd};
 
 use claude::{list_projects, list_sessions, parse_session};
 use codex::{list_codex_projects, list_codex_sessions_for_project, parse_codex_session};
@@ -1269,12 +1270,115 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Render markdown text to Ratatui Lines
+fn render_markdown(md: &str) -> Vec<Line<'static>> {
+    let parser = Parser::new(md);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+
+    // Style state stack
+    let mut is_bold = false;
+    let mut is_italic = false;
+    let is_code = false;
+    let mut is_heading = false;
+    let mut in_code_block = false;
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::Heading { .. } => is_heading = true,
+                Tag::Strong => is_bold = true,
+                Tag::Emphasis => is_italic = true,
+                Tag::CodeBlock(_) => in_code_block = true,
+                Tag::List(_) | Tag::Item => {}
+                _ => {}
+            },
+            MdEvent::End(tag) => match tag {
+                TagEnd::Heading(_) => {
+                    is_heading = false;
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                TagEnd::Strong => is_bold = false,
+                TagEnd::Emphasis => is_italic = false,
+                TagEnd::CodeBlock => {
+                    in_code_block = false;
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                TagEnd::Paragraph => {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                    lines.push(Line::from(""));
+                }
+                TagEnd::Item => {
+                    lines.push(Line::from(std::mem::take(&mut current_spans)));
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                let style = compute_style(is_bold, is_italic, is_code || in_code_block, is_heading);
+                for (i, line_text) in text.lines().enumerate() {
+                    if i > 0 {
+                        lines.push(Line::from(std::mem::take(&mut current_spans)));
+                    }
+                    if !line_text.is_empty() {
+                        current_spans.push(Span::styled(line_text.to_string(), style));
+                    }
+                }
+            }
+            MdEvent::Code(code) => {
+                let style = Style::default().bg(Color::Indexed(236)).fg(Color::Green);
+                current_spans.push(Span::styled(code.to_string(), style));
+            }
+            MdEvent::SoftBreak | MdEvent::HardBreak => {
+                lines.push(Line::from(std::mem::take(&mut current_spans)));
+            }
+            _ => {}
+        }
+    }
+
+    // Flush remaining spans
+    if !current_spans.is_empty() {
+        lines.push(Line::from(current_spans));
+    }
+
+    // Remove trailing empty lines
+    while lines.last().map_or(false, |l| l.spans.is_empty()) {
+        lines.pop();
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+/// Compute style based on current state
+fn compute_style(bold: bool, italic: bool, code: bool, heading: bool) -> Style {
+    let mut style = Style::default();
+
+    if heading {
+        style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    } else if code {
+        style = style.bg(Color::Indexed(236)).fg(Color::Green);
+    } else {
+        if bold {
+            style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        }
+        if italic {
+            style = style.fg(Color::Magenta).add_modifier(Modifier::ITALIC);
+        }
+    }
+
+    style
+}
+
 fn render_prompt_tab(turn: &Turn) -> Text<'static> {
     let mut lines = vec![
         Line::styled("User Prompt:".to_string(), Style::default().fg(Color::Cyan).bold()),
         Line::from(""),
     ];
 
+    // User prompt as plain text (don't interpret as markdown)
     for line in turn.user_prompt.lines() {
         lines.push(Line::from(line.to_string()));
     }
@@ -1285,9 +1389,8 @@ fn render_prompt_tab(turn: &Turn) -> Text<'static> {
         lines.push(Line::from(""));
         lines.push(Line::styled("Response:".to_string(), Style::default().fg(Color::Green).bold()));
         lines.push(Line::from(""));
-        for line in turn.response.lines() {
-            lines.push(Line::from(line.to_string()));
-        }
+        // Render response as markdown
+        lines.extend(render_markdown(&turn.response));
     }
 
     Text::from(lines)
@@ -1299,9 +1402,8 @@ fn render_thinking_tab(turn: &Turn) -> Text<'static> {
             Line::styled("Model Thinking:".to_string(), Style::default().fg(Color::Magenta).bold()),
             Line::from(""),
         ];
-        for line in thinking.lines() {
-            lines.push(Line::from(line.to_string()));
-        }
+        // Render thinking as markdown
+        lines.extend(render_markdown(thinking));
         Text::from(lines)
     } else {
         Text::styled("No thinking available for this turn".to_string(), Style::default().fg(Color::DarkGray))
