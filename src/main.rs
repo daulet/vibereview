@@ -49,25 +49,96 @@ pub enum UploadState {
 }
 
 /// A unified session that can come from either source.
+/// Sessions with the same slug are grouped together.
 #[derive(Debug, Clone)]
 pub struct UnifiedSession {
     pub source: Source,
-    pub path: PathBuf,
+    /// All session file paths (grouped by slug, sorted oldest to newest)
+    pub paths: Vec<PathBuf>,
+    /// Display name (first session ID or slug)
     pub name: String,
     pub project: String,
     pub modified: Option<std::time::SystemTime>,
     pub description: Option<String>,
+    /// Session slug (used for grouping continuations)
+    pub slug: Option<String>,
+    /// Number of session files in this group
+    pub part_count: usize,
+}
+
+impl UnifiedSession {
+    /// Parse all session files and combine turns into a single Session.
+    /// For grouped sessions (multiple paths), turns from all parts are combined chronologically.
+    pub fn parse(&self) -> Result<Session, String> {
+        match self.source {
+            Source::Claude => {
+                if self.paths.len() == 1 {
+                    parse_session(&self.paths[0])
+                } else {
+                    // Parse all parts and combine turns
+                    let mut combined_turns: Vec<Turn> = Vec::new();
+                    let mut session_name = self.name.clone();
+                    let mut project_path = None;
+
+                    for path in &self.paths {
+                        match parse_session(path) {
+                            Ok(session) => {
+                                if project_path.is_none() {
+                                    project_path = session.project_path.clone();
+                                }
+                                // Use slug as name if available
+                                if self.slug.is_some() {
+                                    session_name = self.slug.clone().unwrap_or(session.name);
+                                }
+                                combined_turns.extend(session.turns);
+                            }
+                            Err(e) => {
+                                // Log error but continue with other parts
+                                eprintln!("Warning: Failed to parse {}: {}", path.display(), e);
+                            }
+                        }
+                    }
+
+                    Ok(Session {
+                        id: self.name.clone(),
+                        name: session_name,
+                        source: models::SessionSource::ClaudeCode { version: None },
+                        project_path,
+                        turns: combined_turns,
+                    })
+                }
+            }
+            Source::Codex => {
+                // Codex sessions are not grouped
+                parse_codex_session(&self.paths[0])
+            }
+        }
+    }
 }
 
 // =============================================================================
 // Unified Listing Functions
 // =============================================================================
 
-/// List ALL sessions from both Claude and Codex across all projects, sorted by recency.
-fn list_all_sessions() -> Vec<UnifiedSession> {
-    let mut sessions = Vec::new();
+/// Intermediate struct for collecting session parts before grouping
+struct SessionPart {
+    source: Source,
+    path: PathBuf,
+    name: String,
+    project: String,
+    modified: Option<std::time::SystemTime>,
+    description: Option<String>,
+    slug: Option<String>,
+}
 
-    // Add Claude sessions from all projects
+/// List ALL sessions from both Claude and Codex across all projects, sorted by recency.
+/// Sessions with the same slug are grouped together.
+fn list_all_sessions() -> Vec<UnifiedSession> {
+    use std::collections::HashMap;
+
+    let mut parts: Vec<SessionPart> = Vec::new();
+
+    // Collect Claude sessions from all projects
     for claude_project in list_projects() {
         let project_name = PathBuf::from(&claude_project.decoded_path)
             .file_name()
@@ -76,29 +147,86 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
             .to_string();
 
         for session in list_sessions(&claude_project.path) {
-            sessions.push(UnifiedSession {
+            parts.push(SessionPart {
                 source: Source::Claude,
                 path: session.path,
                 name: session.name,
                 project: project_name.clone(),
                 modified: session.modified,
                 description: session.description,
+                slug: session.slug,
             });
         }
     }
 
-    // Add Codex sessions from all projects
+    // Collect Codex sessions from all projects
     for codex_project in list_codex_projects() {
         for session in list_codex_sessions_for_project(&codex_project.path) {
-            sessions.push(UnifiedSession {
+            parts.push(SessionPart {
                 source: Source::Codex,
                 path: session.path,
                 name: session.name,
                 project: codex_project.name.clone(),
                 modified: session.modified,
                 description: session.description,
+                slug: None, // Codex doesn't have slugs
             });
         }
+    }
+
+    // Group sessions by slug (Claude only, Codex sessions stay individual)
+    let mut slug_groups: HashMap<String, Vec<SessionPart>> = HashMap::new();
+    let mut no_slug_sessions: Vec<SessionPart> = Vec::new();
+
+    for part in parts {
+        if let Some(ref slug) = part.slug {
+            slug_groups.entry(slug.clone()).or_default().push(part);
+        } else {
+            no_slug_sessions.push(part);
+        }
+    }
+
+    let mut sessions: Vec<UnifiedSession> = Vec::new();
+
+    // Convert grouped sessions
+    for (slug, mut group) in slug_groups {
+        // Sort group by modification time (oldest first, so paths are in chronological order)
+        group.sort_by(|a, b| a.modified.cmp(&b.modified));
+
+        let part_count = group.len();
+        let paths: Vec<PathBuf> = group.iter().map(|p| p.path.clone()).collect();
+
+        // Use the most recent session's metadata
+        let latest = group.last().unwrap();
+        // Use the oldest session's description (original conversation start)
+        let description = group.iter()
+            .find_map(|p| p.description.clone())
+            .or_else(|| latest.description.clone());
+
+        sessions.push(UnifiedSession {
+            source: latest.source,
+            paths,
+            name: group.first().unwrap().name.clone(), // Use first session ID
+            project: latest.project.clone(),
+            modified: latest.modified,
+            description,
+            slug: Some(slug),
+            part_count,
+        });
+    }
+
+    // Add sessions without slugs as individual entries
+    for part in no_slug_sessions {
+        sessions.push(UnifiedSession {
+            source: part.source,
+            paths: vec![part.path],
+            name: part.name,
+            project: part.project,
+            modified: part.modified,
+            description: part.description,
+            slug: None,
+            part_count: 1,
+        });
     }
 
     // Sort by modification time, newest first
@@ -384,11 +512,7 @@ impl App {
                 // Try to load from selected session in browser
                 if let Some(i) = self.session_list_state.selected() {
                     if let Some(session_info) = self.sessions.get(i) {
-                        let result = match session_info.source {
-                            Source::Claude => parse_session(&session_info.path),
-                            Source::Codex => parse_codex_session(&session_info.path),
-                        };
-                        match result {
+                        match session_info.parse() {
                             Ok(s) => s,
                             Err(e) => {
                                 self.upload_state = UploadState::Error {
@@ -456,11 +580,7 @@ impl App {
             KeyCode::Enter => {
                 if let Some(i) = self.session_list_state.selected() {
                     if let Some(session_info) = self.sessions.get(i) {
-                        let result = match session_info.source {
-                            Source::Claude => parse_session(&session_info.path),
-                            Source::Codex => parse_codex_session(&session_info.path),
-                        };
-                        match result {
+                        match session_info.parse() {
                             Ok(session) => {
                                 let context = TurnContext::new(
                                     session.name.clone(),
@@ -914,12 +1034,12 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Column widths:
-    // ID: 16 chars (e.g., "claude:063cd168")
+    // ID: 19 chars (e.g., "claude:063cd168×2")
     // TIME: 8 chars (e.g., "12h ago")
     // SOURCE: 6 chars (e.g., "claude")
     // PROJECT: 16 chars
     // DESCRIPTION: remaining
-    let id_width = 16;
+    let id_width = 19;
     let time_width = 8;
     let source_width = 6;
     let project_width = 16;
@@ -951,8 +1071,16 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .sessions
         .iter()
         .map(|s| {
+            // Show part count for grouped sessions (e.g., "claude:063cd168×2")
             let id = match s.source {
-                Source::Claude => format!("claude:{}", &s.name[..8.min(s.name.len())]),
+                Source::Claude => {
+                    let base = format!("claude:{}", &s.name[..8.min(s.name.len())]);
+                    if s.part_count > 1 {
+                        format!("{}×{}", base, s.part_count)
+                    } else {
+                        base
+                    }
+                }
                 Source::Codex => format!("codex:{}", &s.name[..8.min(s.name.len())]),
             };
             let time = format_time_ago(s.modified);
@@ -1646,4 +1774,178 @@ fn main() -> Result<()> {
     io::stdout().execute(LeaveAlternateScreen)?;
 
     Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== SESSION GROUPING TESTS ====================
+
+    #[test]
+    fn test_session_grouping_by_slug() {
+        // Test that list_all_sessions groups sessions with the same slug
+        let sessions = list_all_sessions();
+
+        // Find sessions by slug
+        let unified_exploring_gray: Vec<_> = sessions.iter()
+            .filter(|s| s.slug.as_deref() == Some("unified-exploring-gray"))
+            .collect();
+
+        // Should be grouped into one entry
+        assert!(
+            unified_exploring_gray.len() <= 1,
+            "Sessions with same slug should be grouped: found {} entries",
+            unified_exploring_gray.len()
+        );
+
+        // If the session exists, it should have multiple parts
+        if let Some(session) = unified_exploring_gray.first() {
+            assert!(
+                session.part_count >= 2,
+                "unified-exploring-gray should have at least 2 parts, got {}",
+                session.part_count
+            );
+            assert_eq!(
+                session.paths.len(),
+                session.part_count,
+                "paths.len() should match part_count"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sessions_without_slug_not_grouped() {
+        let sessions = list_all_sessions();
+
+        // Sessions without slugs should have part_count = 1
+        for session in &sessions {
+            if session.slug.is_none() {
+                assert_eq!(
+                    session.part_count, 1,
+                    "Session without slug should have part_count=1: {}",
+                    session.name
+                );
+                assert_eq!(
+                    session.paths.len(), 1,
+                    "Session without slug should have single path: {}",
+                    session.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_grouped_session_paths_sorted_chronologically() {
+        let sessions = list_all_sessions();
+
+        // For grouped sessions, paths should be sorted oldest to newest
+        for session in &sessions {
+            if session.part_count > 1 {
+                // Verify paths are in chronological order by checking file modification times
+                let mut prev_modified: Option<std::time::SystemTime> = None;
+                for path in &session.paths {
+                    if let Ok(metadata) = std::fs::metadata(path) {
+                        if let Ok(modified) = metadata.modified() {
+                            if let Some(prev) = prev_modified {
+                                assert!(
+                                    modified >= prev,
+                                    "Paths should be sorted oldest to newest in session {}",
+                                    session.name
+                                );
+                            }
+                            prev_modified = Some(modified);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unified_session_parse_single_file() {
+        let sessions = list_all_sessions();
+
+        // Find a session with single part
+        if let Some(single_session) = sessions.iter().find(|s| s.part_count == 1 && s.source == Source::Claude) {
+            let result = single_session.parse();
+            assert!(result.is_ok(), "Should parse single-file session: {:?}", result.err());
+
+            let session = result.unwrap();
+            assert!(!session.turns.is_empty(), "Parsed session should have turns");
+        }
+    }
+
+    #[test]
+    fn test_unified_session_parse_grouped_files() {
+        let sessions = list_all_sessions();
+
+        // Find a grouped session (multiple parts)
+        if let Some(grouped_session) = sessions.iter().find(|s| s.part_count > 1) {
+            let result = grouped_session.parse();
+            assert!(result.is_ok(), "Should parse grouped session: {:?}", result.err());
+
+            let session = result.unwrap();
+            assert!(!session.turns.is_empty(), "Parsed grouped session should have turns");
+
+            // The combined session should have more turns than individual files
+            // (This is a sanity check - actual count depends on the specific sessions)
+        }
+    }
+
+    #[test]
+    fn test_no_duplicate_sessions_in_list() {
+        let sessions = list_all_sessions();
+
+        // Check that no two sessions have overlapping paths
+        let mut all_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for session in &sessions {
+            for path in &session.paths {
+                assert!(
+                    all_paths.insert(path.clone()),
+                    "Path {:?} appears in multiple sessions",
+                    path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_session_display_with_part_count() {
+        // Test that grouped sessions would display correctly with ×N indicator
+        let sessions = list_all_sessions();
+
+        for session in &sessions {
+            let id = match session.source {
+                Source::Claude => {
+                    let base = format!("claude:{}", &session.name[..8.min(session.name.len())]);
+                    if session.part_count > 1 {
+                        format!("{}×{}", base, session.part_count)
+                    } else {
+                        base
+                    }
+                }
+                Source::Codex => format!("codex:{}", &session.name[..8.min(session.name.len())]),
+            };
+
+            // Verify format
+            if session.part_count > 1 {
+                assert!(
+                    id.contains('×'),
+                    "Grouped session should have × indicator: {}",
+                    id
+                );
+            } else if session.source == Source::Claude {
+                assert!(
+                    !id.contains('×'),
+                    "Single session should not have × indicator: {}",
+                    id
+                );
+            }
+        }
+    }
 }

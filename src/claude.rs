@@ -74,13 +74,14 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
             let modified = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .ok();
-            // Extract description (summary or first user message)
-            let description = extract_session_description(&path);
+            // Extract description and slug
+            let (description, slug) = extract_session_metadata(&path);
             sessions.push(SessionInfo {
                 name,
                 path,
                 modified,
                 description,
+                slug,
             });
         }
     }
@@ -90,27 +91,42 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     sessions
 }
 
-/// Extract session description from summary or first user message.
-fn extract_session_description(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+/// Extract session metadata: description and slug.
+fn extract_session_metadata(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(file) = File::open(path) else {
+        return (None, None);
+    };
     let reader = BufReader::new(file);
 
     let mut first_user_content: Option<String> = None;
+    let mut slug: Option<String> = None;
+    let mut description: Option<String> = None;
 
     for line in reader.lines().take(100).flatten() {
-        // First, try to find a summary (preferred)
-        if line.contains("\"type\":\"summary\"") {
+        // Extract slug from any entry that has it
+        if slug.is_none() && line.contains("\"slug\":") {
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                if let Some(summary) = value.get("summary").and_then(|s| s.as_str()) {
-                    return Some(summary.to_string());
+                if let Some(s) = value.get("slug").and_then(|s| s.as_str()) {
+                    slug = Some(s.to_string());
                 }
             }
         }
-        // Also capture first real user message as fallback
+
+        // Try to find a summary (preferred for description)
+        if description.is_none() && line.contains("\"type\":\"summary\"") {
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if let Some(summary) = value.get("summary").and_then(|s| s.as_str()) {
+                    description = Some(summary.to_string());
+                }
+            }
+        }
+
+        // Also capture first real user message as fallback for description
         if first_user_content.is_none()
             && line.contains("\"type\":\"user\"")
             && !line.contains("\"isMeta\":true")
             && !line.contains("<local-command")
+            && !line.contains("\"isCompactSummary\":true")
         {
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
                 if let Some(content) = value
@@ -125,9 +141,14 @@ fn extract_session_description(path: &Path) -> Option<String> {
                 }
             }
         }
+
+        // Early exit if we have everything
+        if slug.is_some() && description.is_some() {
+            break;
+        }
     }
 
-    first_user_content
+    (description.or(first_user_content), slug)
 }
 
 /// Quick check if a session file has actual conversation (not just metadata or local commands).
@@ -152,6 +173,7 @@ pub struct SessionInfo {
     pub path: PathBuf,
     pub modified: Option<std::time::SystemTime>,
     pub description: Option<String>,
+    pub slug: Option<String>,
 }
 
 /// Parse a Claude Code session file.
@@ -1442,5 +1464,104 @@ mod tests {
 
         let turns = build_turns(&entries, None, None);
         assert_eq!(turns.len(), 1);
+    }
+
+    // ==================== SLUG EXTRACTION TESTS ====================
+    // Tests for extract_session_metadata which extracts slug and description
+
+    #[test]
+    fn test_extract_session_metadata_with_slug() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("promptui_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_slug_session.jsonl");
+
+        // Create a test session file with slug
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, r#"{{"type":"file-history-snapshot","messageId":"123"}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","slug":"test-slug-name","message":{{"role":"user","content":"Hello"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"summary","summary":"Test summary description"}}"#).unwrap();
+        drop(file);
+
+        let (description, slug) = extract_session_metadata(&path);
+
+        assert_eq!(slug, Some("test-slug-name".to_string()));
+        assert_eq!(description, Some("Test summary description".to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_extract_session_metadata_without_slug() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("promptui_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_no_slug_session.jsonl");
+
+        // Create a test session file without slug
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, r#"{{"type":"file-history-snapshot","messageId":"123"}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"First user message"}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"Response"}}]}}}}"#).unwrap();
+        drop(file);
+
+        let (description, slug) = extract_session_metadata(&path);
+
+        assert_eq!(slug, None);
+        assert_eq!(description, Some("First user message".to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_extract_session_metadata_skips_compact_summary() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("promptui_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_compact_summary_session.jsonl");
+
+        // Create a test session file with compact summary (should be skipped for description)
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, r#"{{"type":"system","subtype":"compact_boundary","slug":"compacted-session"}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","isCompactSummary":true,"message":{{"role":"user","content":"This is a long summary..."}}}}"#).unwrap();
+        writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"Real user message"}}}}"#).unwrap();
+        drop(file);
+
+        let (description, slug) = extract_session_metadata(&path);
+
+        assert_eq!(slug, Some("compacted-session".to_string()));
+        // Should skip the isCompactSummary message and use the real user message
+        assert_eq!(description, Some("Real user message".to_string()));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_list_sessions_includes_slug() {
+        // Test that list_sessions extracts slug from real sessions
+        let project_path = dirs::home_dir()
+            .map(|h| h.join(".claude/projects/-Users-dzhanguzin-dev-personal-promptui"));
+
+        if let Some(path) = project_path {
+            if path.exists() {
+                let sessions = list_sessions(&path);
+
+                // Find a session that should have a slug
+                let session_with_slug = sessions.iter()
+                    .find(|s| s.name == "063cd168-91d2-41bd-b7ba-5d2dee7fc7ab");
+
+                if let Some(session) = session_with_slug {
+                    assert_eq!(session.slug, Some("unified-exploring-gray".to_string()));
+                }
+
+                // Verify continuation session has the same slug
+                let continuation = sessions.iter()
+                    .find(|s| s.name == "bd3dc9cd-e84f-4fa3-866d-c000602cc8e5");
+
+                if let Some(session) = continuation {
+                    assert_eq!(session.slug, Some("unified-exploring-gray".to_string()));
+                }
+            }
+        }
     }
 }
