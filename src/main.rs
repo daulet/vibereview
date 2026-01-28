@@ -48,6 +48,15 @@ pub enum UploadState {
     Error { message: String },
 }
 
+#[derive(Debug, Clone)]
+pub enum ResumeState {
+    Idle,
+    /// Confirming resume with the command to be copied
+    Confirming { command: String },
+    /// Resume command copied to clipboard
+    Complete { command: String },
+}
+
 /// A unified session that can come from either source.
 /// Sessions with the same slug are grouped together.
 #[derive(Debug, Clone)]
@@ -57,7 +66,10 @@ pub struct UnifiedSession {
     pub paths: Vec<PathBuf>,
     /// Display name (first session ID or slug)
     pub name: String,
+    /// Short project name for display
     pub project: String,
+    /// Full project path for resume command
+    pub project_path: PathBuf,
     pub modified: Option<std::time::SystemTime>,
     pub description: Option<String>,
     /// Session slug (used for grouping continuations)
@@ -67,6 +79,47 @@ pub struct UnifiedSession {
 }
 
 impl UnifiedSession {
+    /// Get the session ID to use for resuming (most recent session file).
+    /// For Claude: returns the full filename stem (UUID)
+    /// For Codex: extracts just the UUID from "rollout-DATE-UUID" format
+    pub fn resume_session_id(&self) -> String {
+        let filename = self.paths
+            .last()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.name.clone());
+
+        match self.source {
+            Source::Claude => filename,
+            Source::Codex => {
+                // Codex filenames are like "rollout-2026-01-27T18-20-41-019c0267-28af-7ae2-9531-008179fabf86"
+                // Extract just the UUID (last 5 hyphen-separated segments: 8-4-4-4-12)
+                let parts: Vec<&str> = filename.rsplitn(6, '-').collect();
+                if parts.len() >= 5 {
+                    // parts are reversed, so join them back in correct order
+                    format!("{}-{}-{}-{}-{}", parts[4], parts[3], parts[2], parts[1], parts[0])
+                } else {
+                    filename
+                }
+            }
+        }
+    }
+
+    /// Get the command to resume this session.
+    pub fn get_resume_command(&self) -> String {
+        let session_id = self.resume_session_id();
+        let project_path = self.project_path.display();
+
+        match self.source {
+            Source::Claude => {
+                format!("cd {} && claude --resume {}", project_path, session_id)
+            }
+            Source::Codex => {
+                format!("cd {} && codex resume {}", project_path, session_id)
+            }
+        }
+    }
+
     /// Parse all session files and combine turns into a single Session.
     /// For grouped sessions (multiple paths), turns from all parts are combined chronologically.
     pub fn parse(&self) -> Result<Session, String> {
@@ -126,6 +179,7 @@ struct SessionPart {
     path: PathBuf,
     name: String,
     project: String,
+    project_path: PathBuf,
     modified: Option<std::time::SystemTime>,
     description: Option<String>,
     slug: Option<String>,
@@ -140,7 +194,8 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
 
     // Collect Claude sessions from all projects
     for claude_project in list_projects() {
-        let project_name = PathBuf::from(&claude_project.decoded_path)
+        let project_path = PathBuf::from(&claude_project.decoded_path);
+        let project_name = project_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
@@ -152,6 +207,7 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
                 path: session.path,
                 name: session.name,
                 project: project_name.clone(),
+                project_path: project_path.clone(),
                 modified: session.modified,
                 description: session.description,
                 slug: session.slug,
@@ -167,6 +223,7 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
                 path: session.path,
                 name: session.name,
                 project: codex_project.name.clone(),
+                project_path: codex_project.path.clone(),
                 modified: session.modified,
                 description: session.description,
                 slug: None, // Codex doesn't have slugs
@@ -208,6 +265,7 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
             paths,
             name: group.first().unwrap().name.clone(), // Use first session ID
             project: latest.project.clone(),
+            project_path: latest.project_path.clone(),
             modified: latest.modified,
             description,
             slug: Some(slug),
@@ -222,6 +280,7 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
             paths: vec![part.path],
             name: part.name,
             project: part.project,
+            project_path: part.project_path,
             modified: part.modified,
             description: part.description,
             slug: None,
@@ -382,12 +441,16 @@ pub struct App {
     pub session_list_state: ListState,
     // Parsed session state
     pub session: Option<Session>,
+    /// Index of the currently viewed session in sessions list (for resume command)
+    pub current_session_index: Option<usize>,
     /// Stack of turn contexts (main session at bottom, subagents pushed on top)
     pub context_stack: Vec<TurnContext>,
     pub should_quit: bool,
     pub error_message: Option<String>,
     /// State of the upload operation
     pub upload_state: UploadState,
+    /// State of the resume operation
+    pub resume_state: ResumeState,
     /// Copy feedback with source info (clears after 1.5s)
     pub copy_feedback: Option<CopyFeedback>,
     /// Current text selection state
@@ -411,10 +474,12 @@ impl App {
             sessions,
             session_list_state,
             session: None,
+            current_session_index: None,
             context_stack: Vec::new(),
             should_quit: false,
             error_message: None,
             upload_state: UploadState::Idle,
+            resume_state: ResumeState::Idle,
             copy_feedback: None,
             text_selection: None,
             content_area: None,
@@ -471,9 +536,14 @@ impl App {
     pub fn handle_key(&mut self, key: KeyCode) {
         self.error_message = None;
 
-        // Handle upload modal first
+        // Handle modals first
         if !matches!(self.upload_state, UploadState::Idle) {
             self.handle_upload_key(key);
+            return;
+        }
+
+        if !matches!(self.resume_state, ResumeState::Idle) {
+            self.handle_resume_key(key);
             return;
         }
 
@@ -502,6 +572,30 @@ impl App {
                 self.upload_state = UploadState::Idle;
             }
             _ => {}
+        }
+    }
+
+    fn handle_resume_key(&mut self, key: KeyCode) {
+        match &self.resume_state {
+            ResumeState::Confirming { command } => {
+                match key {
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        // Copy command to clipboard
+                        let cmd = command.clone();
+                        let _ = share::copy_to_clipboard(&cmd);
+                        self.resume_state = ResumeState::Complete { command: cmd };
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        self.resume_state = ResumeState::Idle;
+                    }
+                    _ => {}
+                }
+            }
+            ResumeState::Complete { .. } => {
+                // Any key dismisses the result
+                self.resume_state = ResumeState::Idle;
+            }
+            ResumeState::Idle => {}
         }
     }
 
@@ -587,6 +681,7 @@ impl App {
                                     session.turns.clone(),
                                 );
                                 self.session = Some(session);
+                                self.current_session_index = Some(i);
                                 self.context_stack = vec![context];
                                 self.view = View::SessionViewer;
                             }
@@ -594,6 +689,15 @@ impl App {
                                 self.error_message = Some(format!("Failed to parse session: {}", e));
                             }
                         }
+                    }
+                }
+            }
+            KeyCode::Char('R') => {
+                // Show resume confirmation for selected session
+                if let Some(i) = self.session_list_state.selected() {
+                    if let Some(session_info) = self.sessions.get(i) {
+                        let cmd = session_info.get_resume_command();
+                        self.resume_state = ResumeState::Confirming { command: cmd };
                     }
                 }
             }
@@ -617,6 +721,7 @@ impl App {
                 } else {
                     self.view = View::SessionBrowser;
                     self.session = None;
+                    self.current_session_index = None;
                     self.context_stack.clear();
                 }
             }
@@ -701,6 +806,15 @@ impl App {
                 // Copy response only
                 let content = self.get_response_text();
                 self.copy_to_clipboard(content, CopySource::Response);
+            }
+            KeyCode::Char('R') => {
+                // Show resume confirmation
+                if let Some(i) = self.current_session_index {
+                    if let Some(session_info) = self.sessions.get(i) {
+                        let cmd = session_info.get_resume_command();
+                        self.resume_state = ResumeState::Confirming { command: cmd };
+                    }
+                }
             }
             _ => {}
         }
@@ -943,6 +1057,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if !matches!(app.upload_state, UploadState::Idle) {
         render_upload_modal(frame, app);
     }
+
+    // Render resume modal if active
+    if !matches!(app.resume_state, ResumeState::Idle) {
+        render_resume_modal(frame, app);
+    }
 }
 
 fn render_upload_modal(frame: &mut Frame, app: &App) {
@@ -1030,6 +1149,64 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
     frame.render_widget(modal, modal_area);
 }
 
+fn render_resume_modal(frame: &mut Frame, app: &App) {
+    if matches!(app.resume_state, ResumeState::Idle) {
+        return;
+    }
+
+    let area = frame.area();
+    let modal_width = 70.min(area.width.saturating_sub(4));
+    let modal_height = 12.min(area.height.saturating_sub(4));
+    let modal_area = Rect {
+        x: (area.width - modal_width) / 2,
+        y: (area.height - modal_height) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    // Clear background
+    frame.render_widget(Clear, modal_area);
+
+    let (title, content, style) = match &app.resume_state {
+        ResumeState::Idle => return,
+        ResumeState::Confirming { command } => (
+            " Resume Session ",
+            format!(
+                "Resume this session?\n\n\
+                Command:\n\
+                {}\n\n\
+                Press Enter or 'y' to copy command, Esc or 'n' to cancel",
+                command
+            ),
+            Style::default().fg(Color::Yellow),
+        ),
+        ResumeState::Complete { command } => (
+            " Resume Command Copied ",
+            format!(
+                "Command copied to clipboard!\n\n\
+                {}\n\n\
+                Paste and run in your terminal.\n\n\
+                Press any key to close",
+                command
+            ),
+            Style::default().fg(Color::Green),
+        ),
+    };
+
+    let modal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(style)
+                .title(title)
+                .title_style(style.add_modifier(Modifier::BOLD)),
+        )
+        .wrap(Wrap { trim: false })
+        .style(Style::default().fg(Color::White));
+
+    frame.render_widget(modal, modal_area);
+}
+
 fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -1046,7 +1223,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
     // borders(2) + highlight(2) + spacing(4 separators * 2 = 8) = 12
     let desc_width = (area.width as usize).saturating_sub(12 + id_width + time_width + source_width + project_width).max(10);
 
-    let title = format!(" Sessions ({}) - Enter: open | u: share | q: quit ", app.sessions.len());
+    let title = format!(" Sessions ({}) - Enter: open | R: resume | u: share | q: quit ", app.sessions.len());
 
     // Render header line and list
     let chunks = Layout::default()
@@ -1300,12 +1477,12 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     } else if app.is_subagent_view() {
         (
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | Mouse: Select | Esc: Back | q: Quit ".to_string(),
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | R: Resume | Esc: Back | q: Quit ".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
         (
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | Mouse: Select | Enter: Open | q: Quit ".to_string(),
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | R: Resume | Enter: Open | q: Quit ".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1944,6 +2121,184 @@ mod tests {
                     !id.contains('×'),
                     "Single session should not have × indicator: {}",
                     id
+                );
+            }
+        }
+    }
+
+    // ==================== RESUME COMMAND TESTS ====================
+
+    #[test]
+    fn test_resume_session_id_single_file() {
+        let sessions = list_all_sessions();
+
+        // For single-file sessions:
+        // - Claude: resume_session_id should be the filename stem (UUID)
+        // - Codex: resume_session_id should be just the UUID extracted from filename
+        for session in &sessions {
+            if session.part_count == 1 {
+                let resume_id = session.resume_session_id();
+                let filename_stem = session.paths[0]
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                match session.source {
+                    Source::Claude => {
+                        assert_eq!(
+                            resume_id, filename_stem,
+                            "Claude resume ID should match filename stem"
+                        );
+                    }
+                    Source::Codex => {
+                        // Codex extracts just the UUID from "rollout-DATE-UUID"
+                        assert!(
+                            filename_stem.contains(&resume_id),
+                            "Codex filename should contain the resume UUID: {} not in {}",
+                            resume_id, filename_stem
+                        );
+                        assert!(
+                            !resume_id.contains("rollout"),
+                            "Codex resume ID should not contain 'rollout'"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_resume_session_id_grouped_files() {
+        let sessions = list_all_sessions();
+
+        // For grouped sessions, resume_session_id should be the LAST file's ID (most recent)
+        for session in &sessions {
+            if session.part_count > 1 {
+                let resume_id = session.resume_session_id();
+                let expected_id = session.paths.last()
+                    .and_then(|p| p.file_stem())
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                assert_eq!(
+                    resume_id, expected_id,
+                    "Resume ID for grouped session should be the most recent file's ID"
+                );
+                // The resume ID should NOT be the first session's name (which is used for display)
+                // unless there's only one file
+                assert_ne!(
+                    resume_id, session.name,
+                    "Resume ID should be different from display name for grouped sessions"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_resume_command_claude() {
+        let sessions = list_all_sessions();
+
+        for session in &sessions {
+            if session.source == Source::Claude {
+                let cmd = session.get_resume_command();
+
+                // Should start with cd and include claude --resume
+                assert!(
+                    cmd.starts_with("cd "),
+                    "Claude resume command should start with 'cd ': {}",
+                    cmd
+                );
+                assert!(
+                    cmd.contains("claude --resume"),
+                    "Claude resume command should contain 'claude --resume': {}",
+                    cmd
+                );
+
+                // Should contain the project path
+                let project_path = session.project_path.display().to_string();
+                assert!(
+                    cmd.contains(&project_path),
+                    "Resume command should contain project path '{}': {}",
+                    project_path,
+                    cmd
+                );
+
+                // Should contain the resume session ID
+                let resume_id = session.resume_session_id();
+                assert!(
+                    cmd.contains(&resume_id),
+                    "Resume command should contain session ID '{}': {}",
+                    resume_id,
+                    cmd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_resume_command_codex() {
+        let sessions = list_all_sessions();
+
+        for session in &sessions {
+            if session.source == Source::Codex {
+                let cmd = session.get_resume_command();
+                let resume_id = session.resume_session_id();
+
+                // Should start with cd and include codex resume (not --resume)
+                assert!(
+                    cmd.starts_with("cd "),
+                    "Codex resume command should start with 'cd ': {}",
+                    cmd
+                );
+                assert!(
+                    cmd.contains("codex resume"),
+                    "Codex resume command should contain 'codex resume': {}",
+                    cmd
+                );
+                assert!(
+                    !cmd.contains("--resume"),
+                    "Codex resume command should NOT contain '--resume': {}",
+                    cmd
+                );
+                // Resume ID should be just the UUID (not contain "rollout" or date)
+                assert!(
+                    !resume_id.contains("rollout"),
+                    "Codex resume ID should not contain 'rollout': {}",
+                    resume_id
+                );
+                assert!(
+                    !resume_id.contains("T"),
+                    "Codex resume ID should not contain datetime 'T': {}",
+                    resume_id
+                );
+                // UUID format: 8-4-4-4-12 hex characters
+                let uuid_parts: Vec<&str> = resume_id.split('-').collect();
+                assert_eq!(
+                    uuid_parts.len(), 5,
+                    "Codex resume ID should have 5 UUID parts: {}",
+                    resume_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_session_has_project_path() {
+        let sessions = list_all_sessions();
+
+        for session in &sessions {
+            // All sessions should have a valid project path
+            assert!(
+                !session.project_path.as_os_str().is_empty(),
+                "Session {} should have a non-empty project path",
+                session.name
+            );
+
+            // Claude sessions should have decoded project paths (starting with /)
+            if session.source == Source::Claude {
+                assert!(
+                    session.project_path.is_absolute(),
+                    "Claude session project path should be absolute: {:?}",
+                    session.project_path
                 );
             }
         }
