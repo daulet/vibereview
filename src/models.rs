@@ -105,23 +105,23 @@ pub struct TodoItem {
 impl ToolType {
     pub fn name(&self) -> &str {
         match self {
-            ToolType::FileRead { .. } => "Read",
-            ToolType::FileWrite { .. } => "Write",
-            ToolType::FileEdit { .. } => "Edit",
-            ToolType::Command { .. } => "Bash",
-            ToolType::Search { .. } => "Search",
-            ToolType::WebFetch { .. } => "WebFetch",
-            ToolType::WebSearch { .. } => "WebSearch",
-            ToolType::TodoUpdate { .. } => "TodoWrite",
-            ToolType::Task { .. } => "Task",
-            ToolType::Other { name } => name,
+            Self::FileRead { .. } => "Read",
+            Self::FileWrite { .. } => "Write",
+            Self::FileEdit { .. } => "Edit",
+            Self::Command { .. } => "Bash",
+            Self::Search { .. } => "Search",
+            Self::WebFetch { .. } => "WebFetch",
+            Self::WebSearch { .. } => "WebSearch",
+            Self::TodoUpdate { .. } => "TodoWrite",
+            Self::Task { .. } => "Task",
+            Self::Other { name } => name,
         }
     }
 
     /// Returns a diff string if this tool type has one.
     pub fn diff(&self) -> Option<String> {
         match self {
-            ToolType::FileEdit { diff, old_content, new_content, .. } => {
+            Self::FileEdit { diff, old_content, new_content, .. } => {
                 if let Some(d) = diff {
                     return Some(d.clone());
                 }
@@ -132,11 +132,11 @@ impl ToolType {
                     None
                 }
             }
-            ToolType::FileWrite { content, path } => {
+            Self::FileWrite { content, path } => {
                 // Show as all additions
                 let lines: Vec<String> = content
                     .lines()
-                    .map(|l| format!("+{}", l))
+                    .map(|l| format!("+{l}"))
                     .collect();
                 Some(format!("--- /dev/null\n+++ {}\n{}", path, lines.join("\n")))
             }

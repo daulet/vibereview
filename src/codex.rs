@@ -63,7 +63,10 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
                 .to_string();
 
             // Only include .json and .jsonl files that have actual content
-            if name.ends_with(".json") || name.ends_with(".jsonl") {
+            let is_json = std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl"));
+            if is_json {
                 // Skip empty sessions (no actual user messages)
                 if !codex_session_has_messages(&path) {
                     continue;
@@ -229,13 +232,13 @@ pub fn parse_codex_session(path: &Path) -> Result<Session, String> {
     match extension {
         "jsonl" => parse_jsonl_session(path, &name),
         "json" => parse_json_session(path, &name),
-        _ => Err(format!("Unknown session format: {}", extension)),
+        _ => Err(format!("Unknown session format: {extension}")),
     }
 }
 
 /// Parse new JSONL format session.
 fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
     let reader = BufReader::new(file);
 
     let mut session_id = name.to_string();
@@ -246,7 +249,7 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
     let mut entries: Vec<Value> = Vec::new();
 
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
+        let line = line.map_err(|e| format!("Failed to read line: {e}"))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -293,10 +296,10 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
 /// Parse old JSON format session.
 fn parse_json_session(path: &Path, name: &str) -> Result<Session, String> {
     let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+        .map_err(|e| format!("Failed to read file: {e}"))?;
 
     let data: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        .map_err(|e| format!("Failed to parse JSON: {e}"))?;
 
     let session_id = data.get("session")
         .and_then(|s| s.get("id"))
@@ -371,7 +374,7 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                                     turn.thinking = Some(if existing.is_empty() {
                                         text.to_string()
                                     } else {
-                                        format!("{}\n\n{}", existing, text)
+                                        format!("{existing}\n\n{text}")
                                     });
                                 }
                             }
@@ -441,7 +444,7 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                                     turn.thinking = Some(if existing.is_empty() {
                                         text.to_string()
                                     } else {
-                                        format!("{}\n\n{}", existing, text)
+                                        format!("{existing}\n\n{text}")
                                     });
                                 }
                             }
@@ -528,7 +531,7 @@ fn build_turns_from_json(items: &[Value]) -> Vec<Turn> {
                         turn.thinking = Some(if existing.is_empty() {
                             summary
                         } else {
-                            format!("{}\n\n{}", existing, summary)
+                            format!("{existing}\n\n{summary}")
                         });
                     }
                 }
@@ -614,7 +617,7 @@ fn create_tool_invocation(call: &Value, output: &Value) -> ToolInvocation {
     }
 }
 
-/// Parse Codex tool into our generic ToolType.
+/// Parse Codex tool into our generic `ToolType`.
 fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, String, String) {
     match name {
         "shell_command" => {
@@ -645,9 +648,9 @@ fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, Stri
                 .join("\n");
 
             let input_display = if let Some(wd) = &workdir {
-                format!("[{}]\n$ {}", wd, command)
+                format!("[{wd}]\n$ {command}")
             } else {
-                format!("$ {}", command)
+                format!("$ {command}")
             };
 
             (
@@ -687,7 +690,7 @@ fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, Stri
                     diff: Some(input.to_string()),
                 },
                 truncate_display(&path, 60),
-                format!("Patch {}", status),
+                format!("Patch {status}"),
             )
         }
         "update_plan" => {

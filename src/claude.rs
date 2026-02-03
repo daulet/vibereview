@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::models::*;
+use crate::models::{Session, SessionSource, Turn, ToolInvocation, ToolType, TodoItem};
 
 /// Get the Claude projects directory.
 pub fn get_claude_projects_dir() -> Option<PathBuf> {
@@ -33,7 +33,7 @@ pub fn list_projects() -> Vec<ProjectInfo> {
             let decoded_path = name.replacen('-', "/", 1).replace('-', "/");
             projects.push(ProjectInfo {
                 name: name.to_string(),
-                path: path,
+                path,
                 decoded_path,
             });
         }
@@ -60,7 +60,7 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "jsonl") {
+        if path.extension().is_some_and(|e| e == "jsonl") {
             let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
             // Skip agent files - they'll be embedded in parent sessions
             if name.starts_with("agent-") {
@@ -178,7 +178,7 @@ pub struct SessionInfo {
 
 /// Parse a Claude Code session file.
 pub fn parse_session(path: &Path) -> Result<Session, String> {
-    let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
     let reader = BufReader::new(file);
 
     let session_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
@@ -187,7 +187,7 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
 
     let mut entries: Vec<Value> = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
+        let line = line.map_err(|e| format!("Failed to read line: {e}"))?;
         if line.trim().is_empty() {
             continue;
         }
@@ -267,10 +267,9 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, project_dir: 
                     );
                     i += 1;
                     continue;
-                } else {
-                    // New user turn, stop here
-                    break;
                 }
+                // New user turn, stop here
+                break;
             }
 
             if next_type == "assistant" {
@@ -530,9 +529,9 @@ fn parse_tool_type(
             };
 
             let input_display = if let Some(desc) = description {
-                format!("{}\n$ {}", desc, command)
+                format!("{desc}\n$ {command}")
             } else {
-                format!("$ {}", command)
+                format!("$ {command}")
             };
             let output_display = stdout.clone().unwrap_or_default();
 
@@ -643,7 +642,7 @@ fn parse_tool_type(
             let subagent_turns = agent_id
                 .and_then(|id| {
                     project_dir.and_then(|dir| {
-                        let agent_file = dir.join(format!("agent-{}.jsonl", id));
+                        let agent_file = dir.join(format!("agent-{id}.jsonl"));
                         parse_agent_file(&agent_file).ok()
                     })
                 })
@@ -652,7 +651,7 @@ fn parse_tool_type(
             let input_display = format!("{}\n{}", description, truncate_display(&prompt, 200));
             let turn_count = subagent_turns.len();
             let output_display = if turn_count > 0 {
-                format!("[{} subagent turns]", turn_count)
+                format!("[{turn_count} subagent turns]")
             } else {
                 truncate_display(&result_str.clone().unwrap_or_default(), 500)
             };
@@ -734,7 +733,7 @@ fn extract_result_string(result: Option<&Value>, tool_id: &str, tool_results_dir
 
     // Try to load from external file
     if let Some(dir) = tool_results_dir {
-        let file_path = dir.join(format!("{}.txt", tool_id));
+        let file_path = dir.join(format!("{tool_id}.txt"));
         if file_path.exists() {
             if let Ok(content) = fs::read_to_string(&file_path) {
                 return Some(content);
@@ -749,7 +748,7 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count > max_chars {
         let truncated: String = s.chars().take(max_chars).collect();
-        format!("{}...", truncated)
+        format!("{truncated}...")
     } else {
         s.to_string()
     }
@@ -774,7 +773,7 @@ fn generate_unified_diff(old: &str, new: &str) -> String {
                     ChangeTag::Equal => " ",
                 };
                 let value = change.value().trim_end_matches('\n');
-                result.push(format!("{}{}", tag, value));
+                result.push(format!("{tag}{value}"));
             }
         }
     }
@@ -795,7 +794,7 @@ fn extract_agent_id(result: &str) -> Option<String> {
                 // Extract just the ID part (before any parenthesis or space)
                 let id = after.split(|c: char| c.is_whitespace() || c == '(')
                     .next()
-                    .map(|s| s.trim());
+                    .map(str::trim);
                 if let Some(id) = id {
                     if !id.is_empty() {
                         return Some(id.to_string());
@@ -813,12 +812,12 @@ fn parse_agent_file(path: &Path) -> Result<Vec<Turn>, String> {
         return Ok(Vec::new());
     }
 
-    let file = File::open(path).map_err(|e| format!("Failed to open agent file: {}", e))?;
+    let file = File::open(path).map_err(|e| format!("Failed to open agent file: {e}"))?;
     let reader = BufReader::new(file);
 
     let mut entries: Vec<Value> = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read line: {}", e))?;
+        let line = line.map_err(|e| format!("Failed to read line: {e}"))?;
         if line.trim().is_empty() {
             continue;
         }

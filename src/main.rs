@@ -3,6 +3,7 @@ mod codex;
 mod models;
 mod share;
 
+use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -26,6 +27,17 @@ use pulldown_cmark::{Event as MdEvent, Parser, Tag, TagEnd};
 use claude::{list_projects, list_sessions, parse_session};
 use codex::{list_codex_projects, list_codex_sessions_for_project, parse_codex_session};
 use models::{Session, ToolInvocation, ToolType, Turn};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Background color for search match highlights (dark gray)
+const SEARCH_HIGHLIGHT_BG: Color = Color::Indexed(238);
+/// Background color for the current/active search match
+const SEARCH_CURRENT_BG: Color = Color::Yellow;
+/// Foreground color for the current/active search match
+const SEARCH_CURRENT_FG: Color = Color::Black;
 
 // =============================================================================
 // Unified Types
@@ -82,12 +94,11 @@ impl UnifiedSession {
     /// Get the session ID to use for resuming (most recent session file).
     /// For Claude: returns the full filename stem (UUID)
     /// For Codex: extracts just the UUID from "rollout-DATE-UUID" format
+    #[must_use] 
     pub fn resume_session_id(&self) -> String {
         let filename = self.paths
             .last()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.name.clone());
+            .and_then(|p| p.file_stem()).map_or_else(|| self.name.clone(), |s| s.to_string_lossy().to_string());
 
         match self.source {
             Source::Claude => filename,
@@ -106,16 +117,17 @@ impl UnifiedSession {
     }
 
     /// Get the command to resume this session.
+    #[must_use] 
     pub fn get_resume_command(&self) -> String {
         let session_id = self.resume_session_id();
         let project_path = self.project_path.display();
 
         match self.source {
             Source::Claude => {
-                format!("cd {} && claude --resume {}", project_path, session_id)
+                format!("cd {project_path} && claude --resume {session_id}")
             }
             Source::Codex => {
-                format!("cd {} && codex resume {}", project_path, session_id)
+                format!("cd {project_path} && codex resume {session_id}")
             }
         }
     }
@@ -312,30 +324,30 @@ pub enum DetailTab {
 }
 
 impl DetailTab {
-    fn next(self) -> Self {
+    const fn next(self) -> Self {
         match self {
-            DetailTab::Prompt => DetailTab::Thinking,
-            DetailTab::Thinking => DetailTab::ToolCalls,
-            DetailTab::ToolCalls => DetailTab::Diff,
-            DetailTab::Diff => DetailTab::Prompt,
+            Self::Prompt => Self::Thinking,
+            Self::Thinking => Self::ToolCalls,
+            Self::ToolCalls => Self::Diff,
+            Self::Diff => Self::Prompt,
         }
     }
 
-    fn prev(self) -> Self {
+    const fn prev(self) -> Self {
         match self {
-            DetailTab::Prompt => DetailTab::Diff,
-            DetailTab::Thinking => DetailTab::Prompt,
-            DetailTab::ToolCalls => DetailTab::Thinking,
-            DetailTab::Diff => DetailTab::ToolCalls,
+            Self::Prompt => Self::Diff,
+            Self::Thinking => Self::Prompt,
+            Self::ToolCalls => Self::Thinking,
+            Self::Diff => Self::ToolCalls,
         }
     }
 
-    fn index(self) -> usize {
+    const fn index(self) -> usize {
         match self {
-            DetailTab::Prompt => 0,
-            DetailTab::Thinking => 1,
-            DetailTab::ToolCalls => 2,
-            DetailTab::Diff => 3,
+            Self::Prompt => 0,
+            Self::Thinking => 1,
+            Self::ToolCalls => 2,
+            Self::Diff => 3,
         }
     }
 }
@@ -351,10 +363,10 @@ pub enum SearchScope {
 impl std::fmt::Display for SearchScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SearchScope::SessionList => write!(f, "sessions"),
-            SearchScope::TurnList => write!(f, "turns"),
-            SearchScope::Content => write!(f, "content"),
-            SearchScope::Diff => write!(f, "diff"),
+            Self::SessionList => write!(f, "sessions"),
+            Self::TurnList => write!(f, "turns"),
+            Self::Content => write!(f, "content"),
+            Self::Diff => write!(f, "diff"),
         }
     }
 }
@@ -424,10 +436,10 @@ pub enum CopySource {
 impl std::fmt::Display for CopySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CopySource::Tab(name) => write!(f, "{}", name),
-            CopySource::Prompt => write!(f, "prompt"),
-            CopySource::Response => write!(f, "response"),
-            CopySource::Selection => write!(f, "selection"),
+            Self::Tab(name) => write!(f, "{name}"),
+            Self::Prompt => write!(f, "prompt"),
+            Self::Response => write!(f, "response"),
+            Self::Selection => write!(f, "selection"),
         }
     }
 }
@@ -451,7 +463,7 @@ pub struct TextSelection {
 }
 
 impl TextSelection {
-    fn new(row: u16, col: u16) -> Self {
+    const fn new(row: u16, col: u16) -> Self {
         Self {
             start: (row, col),
             end: (row, col),
@@ -460,7 +472,7 @@ impl TextSelection {
     }
 
     /// Get normalized selection (start <= end)
-    fn normalized(&self) -> ((u16, u16), (u16, u16)) {
+    const fn normalized(&self) -> ((u16, u16), (u16, u16)) {
         if self.start.0 < self.end.0 || (self.start.0 == self.end.0 && self.start.1 <= self.end.1) {
             (self.start, self.end)
         } else {
@@ -498,7 +510,14 @@ pub struct App {
     pub search: Option<SearchState>,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
+    #[must_use] 
     pub fn new() -> Self {
         let sessions = list_all_sessions();
         let mut session_list_state = ListState::default();
@@ -526,6 +545,7 @@ impl App {
     }
 
     /// Get the current (top) context
+    #[must_use] 
     pub fn current_context(&self) -> Option<&TurnContext> {
         self.context_stack.last()
     }
@@ -536,11 +556,13 @@ impl App {
     }
 
     /// Check if we're in a subagent view (depth > 1)
-    pub fn is_subagent_view(&self) -> bool {
+    #[must_use] 
+    pub const fn is_subagent_view(&self) -> bool {
         self.context_stack.len() > 1
     }
 
     /// Get the breadcrumb path
+    #[must_use] 
     pub fn breadcrumb(&self) -> String {
         self.context_stack
             .iter()
@@ -653,7 +675,7 @@ impl App {
                             Ok(s) => s,
                             Err(e) => {
                                 self.upload_state = UploadState::Error {
-                                    message: format!("Failed to parse session: {}", e),
+                                    message: format!("Failed to parse session: {e}"),
                                 };
                                 return;
                             }
@@ -680,7 +702,7 @@ impl App {
             Ok(c) => c,
             Err(e) => {
                 self.upload_state = UploadState::Error {
-                    message: format!("Compression failed: {}", e),
+                    message: format!("Compression failed: {e}"),
                 };
                 return;
             }
@@ -697,7 +719,7 @@ impl App {
             }
             Err(e) => {
                 self.upload_state = UploadState::Error {
-                    message: format!("Upload failed: {}", e),
+                    message: format!("Upload failed: {e}"),
                 };
             }
         }
@@ -741,7 +763,7 @@ impl App {
                                 self.view = View::SessionViewer;
                             }
                             Err(e) => {
-                                self.error_message = Some(format!("Failed to parse session: {}", e));
+                                self.error_message = Some(format!("Failed to parse session: {e}"));
                             }
                         }
                     }
@@ -815,8 +837,7 @@ impl App {
                 if let Some(ctx) = self.current_context_mut() {
                     if ctx.active_tab == DetailTab::ToolCalls {
                         let tool_count = ctx.selected_turn()
-                            .map(|t| t.tool_invocations.len())
-                            .unwrap_or(0);
+                            .map_or(0, |t| t.tool_invocations.len());
                         if ctx.tool_scroll_offset < tool_count.saturating_sub(1) {
                             ctx.tool_scroll_offset += 1;
                         }
@@ -840,7 +861,7 @@ impl App {
                     ctx.tool_scroll_offset = 0;
                 }
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('G') | KeyCode::End => {
                 if let Some(ctx) = self.current_context_mut() {
                     ctx.scroll_offset = u16::MAX;
                 }
@@ -850,19 +871,14 @@ impl App {
                     ctx.scroll_offset = 0;
                 }
             }
-            KeyCode::End => {
-                if let Some(ctx) = self.current_context_mut() {
-                    ctx.scroll_offset = u16::MAX;
-                }
-            }
             KeyCode::PageUp => {
-                let page = self.content_area.map(|a| a.height.saturating_sub(1)).unwrap_or(10);
+                let page = self.content_area.map_or(10, |a| a.height.saturating_sub(1));
                 if let Some(ctx) = self.current_context_mut() {
                     ctx.scroll_offset = ctx.scroll_offset.saturating_sub(page);
                 }
             }
             KeyCode::PageDown => {
-                let page = self.content_area.map(|a| a.height.saturating_sub(1)).unwrap_or(10);
+                let page = self.content_area.map_or(10, |a| a.height.saturating_sub(1));
                 if let Some(ctx) = self.current_context_mut() {
                     ctx.scroll_offset = ctx.scroll_offset.saturating_add(page);
                 }
@@ -935,7 +951,7 @@ impl App {
     fn start_search(&mut self, scope: SearchScope) {
         let mut actual_scope = scope;
         if matches!(scope, SearchScope::Diff) {
-            let has_diff = self.get_diff_text().map(|d| !d.is_empty()).unwrap_or(false);
+            let has_diff = self.get_diff_text().is_some_and(|d| !d.is_empty());
             if !has_diff {
                 actual_scope = SearchScope::Content;
             }
@@ -968,21 +984,21 @@ impl App {
                     .unwrap_or_default()
             }
             SearchScope::Content => {
-                if !self.content_lines.is_empty() {
-                    self.content_lines.clone()
-                } else {
+                if self.content_lines.is_empty() {
                     self.get_copyable_content()
-                        .map(|text| text.lines().map(|l| l.to_string()).collect())
+                        .map(|text| text.lines().map(std::string::ToString::to_string).collect())
                         .unwrap_or_default()
+                } else {
+                    self.content_lines.clone()
                 }
             }
             SearchScope::Diff => {
-                if !self.content_lines.is_empty() {
-                    self.content_lines.clone()
-                } else {
+                if self.content_lines.is_empty() {
                     self.get_diff_text()
-                        .map(|text| text.lines().map(|l| l.to_string()).collect())
+                        .map(|text| text.lines().map(std::string::ToString::to_string).collect())
                         .unwrap_or_default()
+                } else {
+                    self.content_lines.clone()
                 }
             }
         }
@@ -1095,14 +1111,14 @@ impl App {
             KeyCode::Backspace => {
                 search.query.pop();
                 search.committed = false;
-                App::update_search_hits(search);
+                Self::update_search_hits(search);
             }
             KeyCode::Char('n') => {
                 if search.committed {
                     self.search_next();
                 } else {
                     search.query.push('n');
-                    App::update_search_hits(search);
+                    Self::update_search_hits(search);
                 }
             }
             KeyCode::Char('p') => {
@@ -1110,14 +1126,14 @@ impl App {
                     self.search_prev();
                 } else {
                     search.query.push('p');
-                    App::update_search_hits(search);
+                    Self::update_search_hits(search);
                 }
             }
             KeyCode::Char(c) => {
                 if !c.is_control() {
                     search.query.push(c);
                     search.committed = false;
-                    App::update_search_hits(search);
+                    Self::update_search_hits(search);
                 }
             }
             _ => {}
@@ -1157,7 +1173,7 @@ impl App {
                             ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
                             _ => "unknown".to_string(),
                         };
-                        diffs.push_str(&format!("--- {} ---\n{}\n\n", path, diff));
+                        let _ = writeln!(diffs, "--- {path} ---\n{diff}\n");
                     }
                 }
                 if diffs.is_empty() {
@@ -1194,7 +1210,7 @@ impl App {
                     ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
                     _ => "unknown".to_string(),
                 };
-                diffs.push_str(&format!("--- {} ---\n{}\n\n", path, diff));
+                let _ = writeln!(diffs, "--- {path} ---\n{diff}\n");
             }
             if let ToolType::Task { subagent_turns, subagent_type, .. } = &tool.tool_type {
                 if !subagent_turns.is_empty() {
@@ -1206,7 +1222,7 @@ impl App {
                                     ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
                                     _ => "unknown".to_string(),
                                 };
-                                diffs.push_str(&format!("--- {} {} ---\n{}\n\n", prefix, path, subdiff));
+                                let _ = writeln!(diffs, "--- {prefix} {path} ---\n{subdiff}\n");
                             }
                         }
                     }
@@ -1223,13 +1239,12 @@ impl App {
     /// Get the current tab name
     fn current_tab_name(&self) -> String {
         self.current_context()
-            .map(|ctx| match ctx.active_tab {
+            .map_or("content", |ctx| match ctx.active_tab {
                 DetailTab::Prompt => "Prompt",
                 DetailTab::Thinking => "Thinking",
                 DetailTab::ToolCalls => "Tool Calls",
                 DetailTab::Diff => "Diff",
             })
-            .unwrap_or("content")
             .to_string()
     }
 
@@ -1318,7 +1333,7 @@ impl App {
         }
     }
 
-    /// Extract selected text from content_lines based on current selection
+    /// Extract selected text from `content_lines` based on current selection
     fn extract_selected_text(&self) -> Option<String> {
         let selection = self.text_selection.as_ref()?;
         let ctx = self.current_context()?;
@@ -1449,19 +1464,17 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
             " Share Complete ",
             format!(
                 "Session shared successfully!\n\n\
-                URL: {}\n\n\
+                URL: {url}\n\n\
                 (Copied to clipboard)\n\n\
-                Press any key to close",
-                url
+                Press any key to close"
             ),
             Style::default().fg(Color::Green),
         ),
         UploadState::Error { message } => (
             " Share Failed ",
             format!(
-                "Error: {}\n\n\
-                Press any key to close",
-                message
+                "Error: {message}\n\n\
+                Press any key to close"
             ),
             Style::default().fg(Color::Red),
         ),
@@ -1506,9 +1519,8 @@ fn render_resume_modal(frame: &mut Frame, app: &App) {
             format!(
                 "Resume this session?\n\n\
                 Command:\n\
-                {}\n\n\
-                Press Enter or 'y' to copy command, Esc or 'n' to cancel",
-                command
+                {command}\n\n\
+                Press Enter or 'y' to copy command, Esc or 'n' to cancel"
             ),
             Style::default().fg(Color::Yellow),
         ),
@@ -1516,10 +1528,9 @@ fn render_resume_modal(frame: &mut Frame, app: &App) {
             " Resume Command Copied ",
             format!(
                 "Command copied to clipboard!\n\n\
-                {}\n\n\
+                {command}\n\n\
                 Paste and run in your terminal.\n\n\
-                Press any key to close",
-                command
+                Press any key to close"
             ),
             Style::default().fg(Color::Green),
         ),
@@ -1602,16 +1613,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
             let desc_display = truncate_str(desc, desc_width);
 
             let display = format!(
-                "{:<id_w$}  {:<time_w$}  {:<src_w$}  {:<proj_w$}  {}",
-                id,
-                time,
-                source,
-                project,
-                desc_display,
-                id_w = id_width,
-                time_w = time_width,
-                src_w = source_width,
-                proj_w = project_width
+                "{id:<id_width$}  {time:<time_width$}  {source:<source_width$}  {project:<project_width$}  {desc_display}"
             );
             ListItem::new(display)
         })
@@ -1652,7 +1654,7 @@ fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
                 .map(|n| n.as_secs())
                 .unwrap_or(secs) - secs) / 3600;
             if hours_ago < 24 {
-                format!("{}h ago", hours_ago)
+                format!("{hours_ago}h ago")
             } else {
                 format!("{}d ago", hours_ago / 24)
             }
@@ -1692,7 +1694,7 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
             let tool_count = turn.tool_invocations.len();
             let tool_info = if tool_count > 0 {
-                format!(" [{}]", tool_count)
+                format!(" [{tool_count}]")
             } else {
                 String::new()
             };
@@ -1796,7 +1798,7 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             app.search.as_ref(),
             ctx.active_tab,
         );
-        let content = apply_selection_highlight(content, &app.text_selection, ctx.scroll_offset, inner_content_area.width);
+        let content = apply_selection_highlight(content, app.text_selection.as_ref(), ctx.scroll_offset, inner_content_area.width);
 
         let paragraph = Paragraph::new(content)
             .block(content_block)
@@ -1847,7 +1849,7 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Apply selection highlighting to text content
-fn apply_selection_highlight(content: Text<'static>, selection: &Option<TextSelection>, scroll_offset: u16, _width: u16) -> Text<'static> {
+fn apply_selection_highlight(content: Text<'static>, selection: Option<&TextSelection>, scroll_offset: u16, _width: u16) -> Text<'static> {
     let Some(sel) = selection else {
         return content;
     };
@@ -1930,9 +1932,8 @@ fn apply_search_highlight(
     };
 
     let is_tab_match = match (search.scope, active_tab) {
-        (SearchScope::Diff, DetailTab::Diff) => true,
         (SearchScope::Content, DetailTab::Diff) => false,
-        (SearchScope::Content, _) => true,
+        (SearchScope::Diff, DetailTab::Diff) | (SearchScope::Content, _) => true,
         _ => false,
     };
 
@@ -1976,7 +1977,7 @@ fn build_search_ranges(line: &str, query: &str, current: Option<(usize, usize)>)
             let col = byte_to_char_idx(line, byte_col);
             let byte_end = byte_col + q_lower.len();
             let end = byte_to_char_idx(line, byte_end);
-            let is_current = current.map(|(_, c)| c == col).unwrap_or(false);
+            let is_current = current.is_some_and(|(_, c)| c == col);
             ranges.push((col, end, is_current));
             start = byte_end.max(byte_col + 1);
         } else {
@@ -1988,8 +1989,8 @@ fn build_search_ranges(line: &str, query: &str, current: Option<(usize, usize)>)
 }
 
 fn apply_ranges_to_line(line: Line<'static>, ranges: &[(usize, usize, bool)]) -> Line<'static> {
-    let highlight_style = Style::default().bg(Color::Indexed(238));
-    let current_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+    let highlight_style = Style::default().bg(SEARCH_HIGHLIGHT_BG);
+    let current_style = Style::default().bg(SEARCH_CURRENT_BG).fg(SEARCH_CURRENT_FG);
 
     let mut new_spans: Vec<Span<'static>> = Vec::new();
     let mut cursor = 0usize;
@@ -2048,8 +2049,7 @@ fn apply_ranges_to_line(line: Line<'static>, ranges: &[(usize, usize, bool)]) ->
 
 fn byte_to_char_idx(s: &str, byte_idx: usize) -> usize {
     s.get(..byte_idx)
-        .map(|prefix| prefix.chars().count())
-        .unwrap_or(0)
+        .map_or(0, |prefix| prefix.chars().count())
 }
 
 fn search_status_line(search: &SearchState) -> String {
@@ -2058,34 +2058,32 @@ fn search_status_line(search: &SearchState) -> String {
         format!(" / Search {}: (type to search, Esc to close) ", search.scope)
     } else if count == 0 {
         format!(" / Search {}: {} (0 matches) ", search.scope, search.query)
+    } else if search.committed {
+        format!(
+            " / Search {}: {} ({}/{})  n/p: next/prev  Enter: jump  Esc: close ",
+            search.scope,
+            search.query,
+            search.cursor + 1,
+            count
+        )
     } else {
-        if search.committed {
-            format!(
-                " / Search {}: {} ({}/{})  n/p: next/prev  Enter: jump  Esc: close ",
-                search.scope,
-                search.query,
-                search.cursor + 1,
-                count
-            )
-        } else {
-            format!(
-                " / Search {}: {} ({}/{})  Enter: jump/enable n/p  Esc: close ",
-                search.scope,
-                search.query,
-                search.cursor + 1,
-                count
-            )
-        }
+        format!(
+            " / Search {}: {} ({}/{})  Enter: jump/enable n/p  Esc: close ",
+            search.scope,
+            search.query,
+            search.cursor + 1,
+            count
+        )
     }
 }
 
-/// Truncate a string to max_chars, adding "…" if truncated
+/// Truncate a string to `max_chars`, adding "…" if truncated
 fn truncate_str(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() > max_chars {
         format!("{}…", s.chars().take(max_chars.saturating_sub(1)).collect::<String>())
     } else {
-        s.to_string()
+        s
     }
 }
 
@@ -2109,7 +2107,6 @@ fn render_markdown(md: &str) -> Vec<Line<'static>> {
                 Tag::Strong => is_bold = true,
                 Tag::Emphasis => is_italic = true,
                 Tag::CodeBlock(_) => in_code_block = true,
-                Tag::List(_) | Tag::Item => {}
                 _ => {}
             },
             MdEvent::End(tag) => match tag {
@@ -2160,7 +2157,7 @@ fn render_markdown(md: &str) -> Vec<Line<'static>> {
     }
 
     // Remove trailing empty lines
-    while lines.last().map_or(false, |l| l.spans.is_empty()) {
+    while lines.last().is_some_and(|l| l.spans.is_empty()) {
         lines.pop();
     }
 
@@ -2172,6 +2169,7 @@ fn render_markdown(md: &str) -> Vec<Line<'static>> {
 }
 
 /// Compute style based on current state
+#[allow(clippy::fn_params_excessive_bools)]
 fn compute_style(bold: bool, italic: bool, code: bool, heading: bool) -> Style {
     let mut style = Style::default();
 
@@ -2265,23 +2263,17 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
         let (tool_label, tool_context) = match &tool.tool_type {
             ToolType::Task { subagent_type, subagent_turns, description, .. } => {
                 let type_info = subagent_type.as_deref().unwrap_or("Task");
-                let label = if !subagent_turns.is_empty() {
-                    format!("{} ({} turns) ⏎", type_info, subagent_turns.len())
-                } else {
+                let label = if subagent_turns.is_empty() {
                     type_info.to_string()
+                } else {
+                    format!("{} ({} turns) ⏎", type_info, subagent_turns.len())
                 };
                 let context = truncate_str(description, 40);
                 (label, context)
             }
-            ToolType::FileRead { path, .. } => {
-                let name = path.rsplit('/').next().unwrap_or(path);
-                (tool.tool_type.name().to_string(), truncate_str(name, 50))
-            }
-            ToolType::FileWrite { path, .. } => {
-                let name = path.rsplit('/').next().unwrap_or(path);
-                (tool.tool_type.name().to_string(), truncate_str(name, 50))
-            }
-            ToolType::FileEdit { path, .. } => {
+            ToolType::FileRead { path, .. }
+            | ToolType::FileWrite { path, .. }
+            | ToolType::FileEdit { path, .. } => {
                 let name = path.rsplit('/').next().unwrap_or(path);
                 (tool.tool_type.name().to_string(), truncate_str(name, 50))
             }
@@ -2311,7 +2303,7 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
         let context_span = if tool_context.is_empty() {
             Span::raw("")
         } else {
-            Span::styled(format!(" {}", tool_context), context_style)
+            Span::styled(format!(" {tool_context}"), context_style)
         };
 
         lines.push(Line::from(vec![
@@ -2328,7 +2320,7 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             // Input
             lines.push(Line::styled("  Input:".to_string(), Style::default().fg(Color::Green)));
             for line in tool.input_display.lines() {
-                lines.push(Line::from(format!("    {}", line)));
+                lines.push(Line::from(format!("    {line}")));
             }
 
             lines.push(Line::from(""));
@@ -2336,7 +2328,7 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             // Output
             lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
             for line in tool.output_display.lines().take(30) {
-                lines.push(Line::from(format!("    {}", line)));
+                lines.push(Line::from(format!("    {line}")));
             }
             if tool.output_display.lines().count() > 30 {
                 lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
@@ -2358,51 +2350,50 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
     Text::from(lines)
 }
 
+fn render_diff_inner(lines: &mut Vec<Line>, tool: &ToolInvocation, prefix: &str) -> bool {
+    if let Some(diff) = tool.tool_type.diff() {
+        let path = match &tool.tool_type {
+            ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+            _ => "unknown".to_string(),
+        };
+
+        let header = if prefix.is_empty() {
+            format!("─── {path} ───")
+        } else {
+            format!("─── {prefix} {path} ───")
+        };
+
+        lines.push(Line::styled(header, Style::default().fg(Color::Cyan).bold()));
+        lines.push(Line::from(""));
+
+        for line in diff.lines() {
+            let line_owned = line.to_string();
+            let styled_line = if line.starts_with('+') && !line.starts_with("+++") {
+                Line::styled(line_owned, Style::default().fg(Color::Green))
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                Line::styled(line_owned, Style::default().fg(Color::Red))
+            } else if line.starts_with("@@") {
+                Line::styled(line_owned, Style::default().fg(Color::Cyan))
+            } else if line.starts_with("---") || line.starts_with("+++") {
+                Line::styled(line_owned, Style::default().fg(Color::White).bold())
+            } else {
+                Line::from(line_owned)
+            };
+            lines.push(styled_line);
+        }
+
+        lines.push(Line::from(""));
+        return true;
+    }
+    false
+}
+
 fn render_diff_tab(turn: &Turn) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     let mut has_diff = false;
 
-    fn render_diff(lines: &mut Vec<Line>, tool: &ToolInvocation, prefix: &str) -> bool {
-        if let Some(diff) = tool.tool_type.diff() {
-            let path = match &tool.tool_type {
-                ToolType::FileEdit { path, .. } => path.clone(),
-                ToolType::FileWrite { path, .. } => path.clone(),
-                _ => "unknown".to_string(),
-            };
-
-            let header = if prefix.is_empty() {
-                format!("─── {} ───", path)
-            } else {
-                format!("─── {} {} ───", prefix, path)
-            };
-
-            lines.push(Line::styled(header, Style::default().fg(Color::Cyan).bold()));
-            lines.push(Line::from(""));
-
-            for line in diff.lines() {
-                let line_owned = line.to_string();
-                let styled_line = if line.starts_with('+') && !line.starts_with("+++") {
-                    Line::styled(line_owned, Style::default().fg(Color::Green))
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    Line::styled(line_owned, Style::default().fg(Color::Red))
-                } else if line.starts_with("@@") {
-                    Line::styled(line_owned, Style::default().fg(Color::Cyan))
-                } else if line.starts_with("---") || line.starts_with("+++") {
-                    Line::styled(line_owned, Style::default().fg(Color::White).bold())
-                } else {
-                    Line::from(line_owned)
-                };
-                lines.push(styled_line);
-            }
-
-            lines.push(Line::from(""));
-            return true;
-        }
-        false
-    }
-
     for tool in &turn.tool_invocations {
-        if render_diff(&mut lines, tool, "") {
+        if render_diff_inner(&mut lines, tool, "") {
             has_diff = true;
         }
 
@@ -2412,7 +2403,7 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
                 let prefix = format!("[{}]", subagent_type.as_deref().unwrap_or("subagent"));
                 for subturn in subagent_turns {
                     for subtool in &subturn.tool_invocations {
-                        if render_diff(&mut lines, subtool, &prefix) {
+                        if render_diff_inner(&mut lines, subtool, &prefix) {
                             has_diff = true;
                         }
                     }

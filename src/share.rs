@@ -35,6 +35,7 @@ impl SharedSession {
 /// Response from the upload API
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadResponse {
+    #[allow(dead_code)]
     pub id: String,
     pub url: String,
 }
