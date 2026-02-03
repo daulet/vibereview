@@ -340,6 +340,41 @@ impl DetailTab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    SessionList,
+    TurnList,
+    Content,
+    Diff,
+}
+
+impl std::fmt::Display for SearchScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchScope::SessionList => write!(f, "sessions"),
+            SearchScope::TurnList => write!(f, "turns"),
+            SearchScope::Content => write!(f, "content"),
+            SearchScope::Diff => write!(f, "diff"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub line: usize,
+    pub col: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchState {
+    pub scope: SearchScope,
+    pub query: String,
+    pub hits: Vec<SearchHit>,
+    pub cursor: usize,
+    pub lines: Vec<String>,
+    pub committed: bool,
+}
+
 /// A view context for navigating turns (main session or subagent)
 #[derive(Debug, Clone)]
 pub struct TurnContext {
@@ -459,6 +494,8 @@ pub struct App {
     pub content_area: Option<Rect>,
     /// Content lines for text extraction (set during render)
     pub content_lines: Vec<String>,
+    /// Search state (active when Some)
+    pub search: Option<SearchState>,
 }
 
 impl App {
@@ -484,6 +521,7 @@ impl App {
             text_selection: None,
             content_area: None,
             content_lines: Vec::new(),
+            search: None,
         }
     }
 
@@ -535,6 +573,11 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyCode) {
         self.error_message = None;
+
+        if self.search.is_some() {
+            self.handle_search_key(key);
+            return;
+        }
 
         // Handle modals first
         if !matches!(self.upload_state, UploadState::Idle) {
@@ -671,6 +714,18 @@ impl App {
             }
             KeyCode::Up => Self::select_prev_in_list(&mut self.session_list_state, self.sessions.len()),
             KeyCode::Down => Self::select_next_in_list(&mut self.session_list_state, self.sessions.len()),
+            KeyCode::PageUp => {
+                let len = self.sessions.len();
+                for _ in 0..10 {
+                    Self::select_prev_in_list(&mut self.session_list_state, len);
+                }
+            }
+            KeyCode::PageDown => {
+                let len = self.sessions.len();
+                for _ in 0..10 {
+                    Self::select_next_in_list(&mut self.session_list_state, len);
+                }
+            }
             KeyCode::Enter => {
                 if let Some(i) = self.session_list_state.selected() {
                     if let Some(session_info) = self.sessions.get(i) {
@@ -700,6 +755,9 @@ impl App {
                         self.resume_state = ResumeState::Confirming { command: cmd };
                     }
                 }
+            }
+            KeyCode::Char('/') => {
+                self.start_search(SearchScope::SessionList);
             }
             _ => {}
         }
@@ -787,6 +845,38 @@ impl App {
                     ctx.scroll_offset = u16::MAX;
                 }
             }
+            KeyCode::Home => {
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = u16::MAX;
+                }
+            }
+            KeyCode::PageUp => {
+                let page = self.content_area.map(|a| a.height.saturating_sub(1)).unwrap_or(10);
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = ctx.scroll_offset.saturating_sub(page);
+                }
+            }
+            KeyCode::PageDown => {
+                let page = self.content_area.map(|a| a.height.saturating_sub(1)).unwrap_or(10);
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = ctx.scroll_offset.saturating_add(page);
+                }
+            }
+            KeyCode::Char('/') => {
+                let scope = match self.current_context().map(|c| c.active_tab) {
+                    Some(DetailTab::Diff) => SearchScope::Diff,
+                    _ => SearchScope::Content,
+                };
+                self.start_search(scope);
+            }
+            KeyCode::Char('f') => {
+                self.start_search(SearchScope::TurnList);
+            }
             KeyCode::Enter => {
                 // Try to open subagent if on Tool Calls tab and tool is openable
                 self.try_open_subagent();
@@ -839,6 +929,198 @@ impl App {
         if let Some((title, turns)) = subagent_data {
             let context = TurnContext::new(title, turns);
             self.context_stack.push(context);
+        }
+    }
+
+    fn start_search(&mut self, scope: SearchScope) {
+        let mut actual_scope = scope;
+        if matches!(scope, SearchScope::Diff) {
+            let has_diff = self.get_diff_text().map(|d| !d.is_empty()).unwrap_or(false);
+            if !has_diff {
+                actual_scope = SearchScope::Content;
+            }
+        }
+
+        let lines = self.search_lines_for_scope(actual_scope);
+        self.search = Some(SearchState {
+            scope: actual_scope,
+            query: String::new(),
+            hits: Vec::new(),
+            cursor: 0,
+            lines,
+            committed: false,
+        });
+    }
+
+    fn search_lines_for_scope(&self, scope: SearchScope) -> Vec<String> {
+        match scope {
+            SearchScope::SessionList => self.sessions.iter().map(|s| {
+                let desc = s.description.as_deref().unwrap_or(&s.name);
+                format!("{} {} {}", s.name, s.project, desc)
+            }).collect(),
+            SearchScope::TurnList => {
+                self.current_context()
+                    .map(|ctx| {
+                        ctx.turns.iter().enumerate().map(|(i, t)| {
+                            format!("{} {}", i + 1, t.user_prompt)
+                        }).collect()
+                    })
+                    .unwrap_or_default()
+            }
+            SearchScope::Content => {
+                if !self.content_lines.is_empty() {
+                    self.content_lines.clone()
+                } else {
+                    self.get_copyable_content()
+                        .map(|text| text.lines().map(|l| l.to_string()).collect())
+                        .unwrap_or_default()
+                }
+            }
+            SearchScope::Diff => {
+                if !self.content_lines.is_empty() {
+                    self.content_lines.clone()
+                } else {
+                    self.get_diff_text()
+                        .map(|text| text.lines().map(|l| l.to_string()).collect())
+                        .unwrap_or_default()
+                }
+            }
+        }
+    }
+
+    fn update_search_hits(search: &mut SearchState) {
+        search.hits.clear();
+        search.cursor = 0;
+
+        let query = search.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        let q = query.to_lowercase();
+
+        for (line_idx, line) in search.lines.iter().enumerate() {
+            let lower = line.to_lowercase();
+            let mut start = 0usize;
+            while start <= lower.len() {
+                if let Some(found) = lower[start..].find(&q) {
+                    let byte_col = start + found;
+                    let col = byte_to_char_idx(line, byte_col);
+                    search.hits.push(SearchHit { line: line_idx, col });
+                    start = byte_col + q.len().max(1);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn apply_search_hit(&mut self) {
+        let (scope, hit_opt) = match &self.search {
+            Some(search) if !search.hits.is_empty() => {
+                let hit = search.hits[search.cursor.min(search.hits.len().saturating_sub(1))].clone();
+                (search.scope, Some(hit))
+            }
+            _ => (SearchScope::Content, None),
+        };
+
+        let Some(hit) = hit_opt else {
+            return;
+        };
+
+        match scope {
+            SearchScope::SessionList => {
+                if hit.line < self.sessions.len() {
+                    self.session_list_state.select(Some(hit.line));
+                }
+            }
+            SearchScope::TurnList => {
+                if let Some(ctx) = self.current_context_mut() {
+                    if hit.line < ctx.turns.len() {
+                        ctx.turn_list_state.select(Some(hit.line));
+                        ctx.scroll_offset = 0;
+                        ctx.tool_scroll_offset = 0;
+                    }
+                }
+            }
+            SearchScope::Content | SearchScope::Diff => {
+                if let Some(ctx) = self.current_context_mut() {
+                    ctx.scroll_offset = hit.line as u16;
+                }
+            }
+        }
+    }
+
+    fn search_next(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.hits.is_empty() {
+            return;
+        }
+        search.cursor = (search.cursor + 1) % search.hits.len();
+        self.apply_search_hit();
+    }
+
+    fn search_prev(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.hits.is_empty() {
+            return;
+        }
+        if search.cursor == 0 {
+            search.cursor = search.hits.len().saturating_sub(1);
+        } else {
+            search.cursor -= 1;
+        }
+        self.apply_search_hit();
+    }
+
+    fn handle_search_key(&mut self, key: KeyCode) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+
+        match key {
+            KeyCode::Esc => {
+                self.search = None;
+            }
+            KeyCode::Enter => {
+                self.apply_search_hit();
+                if let Some(search) = self.search.as_mut() {
+                    search.committed = true;
+                }
+            }
+            KeyCode::Backspace => {
+                search.query.pop();
+                search.committed = false;
+                App::update_search_hits(search);
+            }
+            KeyCode::Char('n') => {
+                if search.committed {
+                    self.search_next();
+                } else {
+                    search.query.push('n');
+                    App::update_search_hits(search);
+                }
+            }
+            KeyCode::Char('p') => {
+                if search.committed {
+                    self.search_prev();
+                } else {
+                    search.query.push('p');
+                    App::update_search_hits(search);
+                }
+            }
+            KeyCode::Char(c) => {
+                if !c.is_control() {
+                    search.query.push(c);
+                    search.committed = false;
+                    App::update_search_hits(search);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -900,6 +1182,42 @@ impl App {
             .and_then(|ctx| ctx.selected_turn())
             .filter(|turn| !turn.response.is_empty())
             .map(|turn| turn.response.clone())
+    }
+
+    fn get_diff_text(&self) -> Option<String> {
+        let ctx = self.current_context()?;
+        let turn = ctx.selected_turn()?;
+        let mut diffs = String::new();
+        for tool in &turn.tool_invocations {
+            if let Some(diff) = tool.tool_type.diff() {
+                let path = match &tool.tool_type {
+                    ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+                    _ => "unknown".to_string(),
+                };
+                diffs.push_str(&format!("--- {} ---\n{}\n\n", path, diff));
+            }
+            if let ToolType::Task { subagent_turns, subagent_type, .. } = &tool.tool_type {
+                if !subagent_turns.is_empty() {
+                    let prefix = format!("[{}]", subagent_type.as_deref().unwrap_or("subagent"));
+                    for subturn in subagent_turns {
+                        for subtool in &subturn.tool_invocations {
+                            if let Some(subdiff) = subtool.tool_type.diff() {
+                                let path = match &subtool.tool_type {
+                                    ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+                                    _ => "unknown".to_string(),
+                                };
+                                diffs.push_str(&format!("--- {} {} ---\n{}\n\n", prefix, path, subdiff));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if diffs.is_empty() {
+            None
+        } else {
+            Some(diffs)
+        }
     }
 
     /// Get the current tab name
@@ -979,6 +1297,20 @@ impl App {
                                 source: CopySource::Selection,
                             });
                         }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if in_content {
+                    if let Some(ctx) = self.current_context_mut() {
+                        ctx.scroll_offset = ctx.scroll_offset.saturating_sub(3);
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if in_content {
+                    if let Some(ctx) = self.current_context_mut() {
+                        ctx.scroll_offset = ctx.scroll_offset.saturating_add(3);
                     }
                 }
             }
@@ -1228,7 +1560,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
     // Render header line and list
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
     let header = format!(
@@ -1295,6 +1627,19 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .highlight_symbol("▶ ");
 
     frame.render_stateful_widget(list, chunks[1], &mut app.session_list_state);
+
+    let (help_text, help_style) = if let Some(search) = &app.search {
+        let status = search_status_line(search);
+        (status, Style::default().fg(Color::Yellow))
+    } else {
+        (
+            " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search | R: Resume | u: Share | q: Quit ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let help = Paragraph::new(help_text).style(help_style);
+    frame.render_widget(help, chunks[2]);
 }
 
 fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
@@ -1446,6 +1791,11 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             .collect();
 
         // Apply selection highlighting if active
+        let content = apply_search_highlight(
+            content,
+            app.search.as_ref(),
+            ctx.active_tab,
+        );
         let content = apply_selection_highlight(content, &app.text_selection, ctx.scroll_offset, inner_content_area.width);
 
         let paragraph = Paragraph::new(content)
@@ -1475,14 +1825,19 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             format!(" ✓ Copied {} to clipboard! ", feedback.source),
             Style::default().fg(Color::Green),
         )
+    } else if let Some(search) = &app.search {
+        (
+            search_status_line(search),
+            Style::default().fg(Color::Yellow),
+        )
     } else if app.is_subagent_view() {
         (
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | R: Resume | Esc: Back | q: Quit ".to_string(),
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy | R: Resume | Esc: Back | q: Quit ".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     } else {
         (
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | c/p/r: Copy | R: Resume | Enter: Open | q: Quit ".to_string(),
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy | R: Resume | Enter: Open | q: Quit ".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1563,6 +1918,165 @@ fn apply_selection_highlight(content: Text<'static>, selection: &Option<TextSele
     }
 
     Text::from(new_lines)
+}
+
+fn apply_search_highlight(
+    content: Text<'static>,
+    search: Option<&SearchState>,
+    active_tab: DetailTab,
+) -> Text<'static> {
+    let Some(search) = search else {
+        return content;
+    };
+
+    let is_tab_match = match (search.scope, active_tab) {
+        (SearchScope::Diff, DetailTab::Diff) => true,
+        (SearchScope::Content, DetailTab::Diff) => false,
+        (SearchScope::Content, _) => true,
+        _ => false,
+    };
+
+    if !is_tab_match {
+        return content;
+    }
+
+    let query = search.query.trim();
+    if query.is_empty() {
+        return content;
+    }
+
+    let current_hit = search.hits.get(search.cursor).map(|h| (h.line, h.col));
+
+    let mut new_lines: Vec<Line<'static>> = Vec::new();
+    for (line_idx, line) in content.lines.into_iter().enumerate() {
+        let ranges = build_search_ranges(
+            &line.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            query,
+            current_hit.filter(|(l, _)| *l == line_idx),
+        );
+        if ranges.is_empty() {
+            new_lines.push(line);
+            continue;
+        }
+        new_lines.push(apply_ranges_to_line(line, &ranges));
+    }
+
+    Text::from(new_lines)
+}
+
+fn build_search_ranges(line: &str, query: &str, current: Option<(usize, usize)>) -> Vec<(usize, usize, bool)> {
+    let mut ranges = Vec::new();
+    let line_lower = line.to_lowercase();
+    let q_lower = query.to_lowercase();
+
+    let mut start = 0usize;
+    while start <= line_lower.len() {
+        if let Some(found) = line_lower[start..].find(&q_lower) {
+            let byte_col = start + found;
+            let col = byte_to_char_idx(line, byte_col);
+            let byte_end = byte_col + q_lower.len();
+            let end = byte_to_char_idx(line, byte_end);
+            let is_current = current.map(|(_, c)| c == col).unwrap_or(false);
+            ranges.push((col, end, is_current));
+            start = byte_end.max(byte_col + 1);
+        } else {
+            break;
+        }
+    }
+
+    ranges
+}
+
+fn apply_ranges_to_line(line: Line<'static>, ranges: &[(usize, usize, bool)]) -> Line<'static> {
+    let highlight_style = Style::default().bg(Color::Indexed(238));
+    let current_style = Style::default().bg(Color::Yellow).fg(Color::Black);
+
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize;
+    let mut range_idx = 0usize;
+
+    for span in line.spans {
+        let span_text = span.content.to_string();
+        let span_len = span_text.chars().count();
+        let span_start = cursor;
+        let span_end = cursor + span_len;
+
+        let chars: Vec<char> = span_text.chars().collect();
+        let mut local_pos = 0usize;
+
+        while range_idx < ranges.len() && ranges[range_idx].1 <= span_start {
+            range_idx += 1;
+        }
+
+        let mut local_range_idx = range_idx;
+        while local_range_idx < ranges.len() && ranges[local_range_idx].0 < span_end {
+            let (range_start, range_end, is_current) = ranges[local_range_idx];
+            let range_start_in_span = range_start.saturating_sub(span_start).min(span_len);
+            let range_end_in_span = range_end.saturating_sub(span_start).min(span_len);
+
+            if local_pos < range_start_in_span {
+                let before: String = chars[local_pos..range_start_in_span].iter().collect();
+                if !before.is_empty() {
+                    new_spans.push(Span::styled(before, span.style));
+                }
+            }
+
+            if range_start_in_span < range_end_in_span {
+                let matched: String = chars[range_start_in_span..range_end_in_span].iter().collect();
+                let style = if is_current { span.style.patch(current_style) } else { span.style.patch(highlight_style) };
+                if !matched.is_empty() {
+                    new_spans.push(Span::styled(matched, style));
+                }
+            }
+
+            local_pos = range_end_in_span;
+            local_range_idx += 1;
+        }
+
+        if local_pos < span_len {
+            let after: String = chars[local_pos..span_len].iter().collect();
+            if !after.is_empty() {
+                new_spans.push(Span::styled(after, span.style));
+            }
+        }
+
+        cursor = span_end;
+    }
+
+    Line::from(new_spans)
+}
+
+fn byte_to_char_idx(s: &str, byte_idx: usize) -> usize {
+    s.get(..byte_idx)
+        .map(|prefix| prefix.chars().count())
+        .unwrap_or(0)
+}
+
+fn search_status_line(search: &SearchState) -> String {
+    let count = search.hits.len();
+    if search.query.is_empty() {
+        format!(" / Search {}: (type to search, Esc to close) ", search.scope)
+    } else if count == 0 {
+        format!(" / Search {}: {} (0 matches) ", search.scope, search.query)
+    } else {
+        if search.committed {
+            format!(
+                " / Search {}: {} ({}/{})  n/p: next/prev  Enter: jump  Esc: close ",
+                search.scope,
+                search.query,
+                search.cursor + 1,
+                count
+            )
+        } else {
+            format!(
+                " / Search {}: {} ({}/{})  Enter: jump/enable n/p  Esc: close ",
+                search.scope,
+                search.query,
+                search.cursor + 1,
+                count
+            )
+        }
+    }
 }
 
 /// Truncate a string to max_chars, adding "…" if truncated

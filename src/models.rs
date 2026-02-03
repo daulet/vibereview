@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use similar::TextDiff;
 
 /// A session contains metadata and a list of conversation turns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,21 +146,9 @@ impl ToolType {
 }
 
 fn generate_simple_diff(old: &str, new: &str) -> String {
-    let mut result = Vec::new();
-    let old_lines: Vec<&str> = old.lines().collect();
-    let new_lines: Vec<&str> = new.lines().collect();
-
-    // Very simple diff - just show removed and added
-    for line in &old_lines {
-        if !new_lines.contains(line) {
-            result.push(format!("-{}", line));
-        }
-    }
-    for line in &new_lines {
-        if !old_lines.contains(line) {
-            result.push(format!("+{}", line));
-        }
-    }
-
-    result.join("\n")
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header("old", "new")
+        .to_string()
 }
