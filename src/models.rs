@@ -88,7 +88,7 @@ pub enum ToolType {
         prompt: String,
         subagent_type: Option<String>,
         result: Option<String>,
-        /// Embedded subagent turns (parsed from agent-{id}.jsonl)
+        /// Embedded subagent turns (parsed from Claude sidechain agent files)
         subagent_turns: Vec<Turn>,
     },
     Other {

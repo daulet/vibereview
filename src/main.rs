@@ -70,7 +70,7 @@ pub enum ResumeState {
 }
 
 /// A unified session that can come from either source.
-/// Sessions with the same slug are grouped together.
+/// Claude sessions with the same slug in the same project are grouped together.
 #[derive(Debug, Clone)]
 pub struct UnifiedSession {
     pub source: Source,
@@ -198,10 +198,8 @@ struct SessionPart {
 }
 
 /// List ALL sessions from both Claude and Codex across all projects, sorted by recency.
-/// Sessions with the same slug are grouped together.
+/// Claude sessions with the same slug in the same project are grouped together.
 fn list_all_sessions() -> Vec<UnifiedSession> {
-    use std::collections::HashMap;
-
     let mut parts: Vec<SessionPart> = Vec::new();
 
     // Collect Claude sessions from all projects
@@ -243,39 +241,49 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
         }
     }
 
-    // Group sessions by slug (Claude only, Codex sessions stay individual)
-    let mut slug_groups: HashMap<String, Vec<SessionPart>> = HashMap::new();
-    let mut no_slug_sessions: Vec<SessionPart> = Vec::new();
+    group_session_parts(parts)
+}
+
+/// Group session parts into unified sessions.
+/// Claude continuations are grouped by `(project_path, slug)` to avoid
+/// cross-project slug collisions.
+fn group_session_parts(parts: Vec<SessionPart>) -> Vec<UnifiedSession> {
+    use std::collections::HashMap;
+
+    let mut slug_groups: HashMap<(PathBuf, String), Vec<SessionPart>> = HashMap::new();
+    let mut ungrouped: Vec<SessionPart> = Vec::new();
 
     for part in parts {
-        if let Some(ref slug) = part.slug {
-            slug_groups.entry(slug.clone()).or_default().push(part);
-        } else {
-            no_slug_sessions.push(part);
+        if part.source == Source::Claude {
+            if let Some(slug) = part.slug.clone() {
+                slug_groups
+                    .entry((part.project_path.clone(), slug))
+                    .or_default()
+                    .push(part);
+                continue;
+            }
         }
+        ungrouped.push(part);
     }
 
     let mut sessions: Vec<UnifiedSession> = Vec::new();
 
-    // Convert grouped sessions
-    for (slug, mut group) in slug_groups {
-        // Sort group by modification time (oldest first, so paths are in chronological order)
+    for ((_project_path, slug), mut group) in slug_groups {
+        // Oldest -> newest, so continuation order is stable.
         group.sort_by(|a, b| a.modified.cmp(&b.modified));
 
         let part_count = group.len();
         let paths: Vec<PathBuf> = group.iter().map(|p| p.path.clone()).collect();
-
-        // Use the most recent session's metadata
         let latest = group.last().unwrap();
-        // Use the oldest session's description (original conversation start)
-        let description = group.iter()
+        let description = group
+            .iter()
             .find_map(|p| p.description.clone())
             .or_else(|| latest.description.clone());
 
         sessions.push(UnifiedSession {
             source: latest.source,
             paths,
-            name: group.first().unwrap().name.clone(), // Use first session ID
+            name: group.first().unwrap().name.clone(),
             project: latest.project.clone(),
             project_path: latest.project_path.clone(),
             modified: latest.modified,
@@ -285,8 +293,7 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
         });
     }
 
-    // Add sessions without slugs as individual entries
-    for part in no_slug_sessions {
+    for part in ungrouped {
         sessions.push(UnifiedSession {
             source: part.source,
             paths: vec![part.path],
@@ -300,7 +307,6 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
         });
     }
 
-    // Sort by modification time, newest first
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
     sessions
 }
@@ -1157,9 +1163,17 @@ impl App {
             DetailTab::Thinking => turn.thinking.clone(),
             DetailTab::ToolCalls => {
                 ctx.selected_tool().map(|tool| {
+                    let tool_kind = if is_subagent_tool(tool) {
+                        "subagent"
+                    } else if is_planning_tool(tool) {
+                        "planning"
+                    } else {
+                        "regular"
+                    };
                     format!(
-                        "Tool: {}\n\nInput:\n{}\n\nOutput:\n{}",
+                        "Tool: {} ({})\n\nInput:\n{}\n\nOutput:\n{}",
                         tool.tool_type.name(),
+                        tool_kind,
                         tool.input_display,
                         tool.output_display
                     )
@@ -2242,7 +2256,8 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
 
     for (i, tool) in turn.tool_invocations.iter().enumerate() {
         let is_selected = i == scroll_offset;
-        let is_openable = matches!(&tool.tool_type, ToolType::Task { subagent_turns, .. } if !subagent_turns.is_empty());
+        let is_openable = is_subagent_tool(tool);
+        let is_planning = is_planning_tool(tool);
 
         // Visual indicator for openable tools
         let marker = if is_selected {
@@ -2255,6 +2270,8 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             Style::default().fg(Color::Yellow).bold()
         } else if is_openable {
             Style::default().fg(Color::Magenta)
+        } else if is_planning {
+            Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::White)
         };
@@ -2295,7 +2312,12 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
                 (tool.tool_type.name().to_string(), summary)
             }
             ToolType::Other { name } => {
-                (name.clone(), String::new())
+                let summary = if is_planning {
+                    truncate_str(tool.input_display.lines().next().unwrap_or(""), 50)
+                } else {
+                    String::new()
+                };
+                (name.clone(), summary)
             }
         };
 
@@ -2305,17 +2327,38 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
         } else {
             Span::styled(format!(" {tool_context}"), context_style)
         };
+        let category_span = if is_openable {
+            Span::styled(" [subagent]", Style::default().fg(Color::Magenta).bold())
+        } else if is_planning {
+            Span::styled(" [plan]", Style::default().fg(Color::Cyan).bold())
+        } else {
+            Span::raw("")
+        };
 
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::DarkGray)),
             Span::styled(tool_label, header_style),
+            category_span,
             context_span,
         ]));
 
         // Show details for selected tool
         if is_selected {
             lines.push(Line::from(""));
+            if is_openable {
+                lines.push(Line::styled(
+                    "  Type: subagent call".to_string(),
+                    Style::default().fg(Color::Magenta),
+                ));
+                lines.push(Line::from(""));
+            } else if is_planning {
+                lines.push(Line::styled(
+                    "  Type: planning call".to_string(),
+                    Style::default().fg(Color::Cyan),
+                ));
+                lines.push(Line::from(""));
+            }
 
             // Input
             lines.push(Line::styled("  Input:".to_string(), Style::default().fg(Color::Green)));
@@ -2348,6 +2391,22 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
     }
 
     Text::from(lines)
+}
+
+fn is_subagent_tool(tool: &ToolInvocation) -> bool {
+    matches!(&tool.tool_type, ToolType::Task { subagent_turns, .. } if !subagent_turns.is_empty())
+}
+
+fn is_planning_tool(tool: &ToolInvocation) -> bool {
+    match &tool.tool_type {
+        // Codex planning tool call
+        ToolType::Other { name } => {
+            name.eq_ignore_ascii_case("plan") || name.eq_ignore_ascii_case("update_plan")
+        }
+        // Claude planning/todo updates
+        ToolType::TodoUpdate { .. } => true,
+        _ => false,
+    }
 }
 
 fn render_diff_inner(lines: &mut Vec<Line>, tool: &ToolInvocation, prefix: &str) -> bool {
@@ -2470,7 +2529,7 @@ mod tests {
 
     #[test]
     fn test_session_grouping_by_slug() {
-        // Test that list_all_sessions groups sessions with the same slug
+        // Test that list_all_sessions groups same-project sessions with the same slug
         let sessions = list_all_sessions();
 
         // Find sessions by slug
@@ -2478,15 +2537,22 @@ mod tests {
             .filter(|s| s.slug.as_deref() == Some("unified-exploring-gray"))
             .collect();
 
-        // Should be grouped into one entry
-        assert!(
-            unified_exploring_gray.len() <= 1,
-            "Sessions with same slug should be grouped: found {} entries",
-            unified_exploring_gray.len()
-        );
+        // Should be grouped into at most one entry per project
+        let mut per_project: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+        for session in &unified_exploring_gray {
+            *per_project.entry(session.project_path.clone()).or_insert(0) += 1;
+        }
+        for (project, count) in per_project {
+            assert!(
+                count <= 1,
+                "Sessions with same slug should be grouped per project: {:?} has {} entries",
+                project,
+                count
+            );
+        }
 
-        // If the session exists, it should have multiple parts
-        if let Some(session) = unified_exploring_gray.first() {
+        // If such sessions exist, at least one should have multiple parts.
+        if let Some(session) = unified_exploring_gray.iter().max_by_key(|s| s.part_count) {
             assert!(
                 session.part_count >= 2,
                 "unified-exploring-gray should have at least 2 parts, got {}",
@@ -2498,6 +2564,46 @@ mod tests {
                 "paths.len() should match part_count"
             );
         }
+    }
+
+    #[test]
+    fn test_same_slug_different_projects_not_grouped() {
+        let now = std::time::SystemTime::now();
+        let parts = vec![
+            SessionPart {
+                source: Source::Claude,
+                path: PathBuf::from("/tmp/project-a/a-1.jsonl"),
+                name: "a-1".to_string(),
+                project: "project-a".to_string(),
+                project_path: PathBuf::from("/tmp/project-a"),
+                modified: Some(now),
+                description: Some("one".to_string()),
+                slug: Some("shared-slug".to_string()),
+            },
+            SessionPart {
+                source: Source::Claude,
+                path: PathBuf::from("/tmp/project-b/b-1.jsonl"),
+                name: "b-1".to_string(),
+                project: "project-b".to_string(),
+                project_path: PathBuf::from("/tmp/project-b"),
+                modified: Some(now),
+                description: Some("two".to_string()),
+                slug: Some("shared-slug".to_string()),
+            },
+        ];
+
+        let sessions = group_session_parts(parts);
+        let grouped: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.slug.as_deref() == Some("shared-slug"))
+            .collect();
+
+        assert_eq!(
+            grouped.len(),
+            2,
+            "Same slug across different projects should not be merged"
+        );
+        assert!(grouped.iter().all(|s| s.part_count == 1));
     }
 
     #[test]
@@ -2807,5 +2913,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_tool_kind_classification_planning_and_subagent() {
+        let planning_tool = ToolInvocation {
+            id: "plan-1".to_string(),
+            tool_type: ToolType::Other { name: "Plan".to_string() },
+            input_display: "1. inspect\n2. implement".to_string(),
+            output_display: "Plan updated".to_string(),
+            raw_input: serde_json::Value::Null,
+            raw_output: None,
+        };
+        assert!(is_planning_tool(&planning_tool));
+        assert!(!is_subagent_tool(&planning_tool));
+
+        let subagent_tool = ToolInvocation {
+            id: "task-1".to_string(),
+            tool_type: ToolType::Task {
+                description: "delegate".to_string(),
+                prompt: "do work".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                result: Some("ok".to_string()),
+                subagent_turns: vec![Turn {
+                    id: "subturn-1".to_string(),
+                    timestamp: None,
+                    user_prompt: "check".to_string(),
+                    thinking: None,
+                    tool_invocations: Vec::new(),
+                    response: "done".to_string(),
+                    model: None,
+                }],
+            },
+            input_display: "delegate".to_string(),
+            output_display: "ok".to_string(),
+            raw_input: serde_json::Value::Null,
+            raw_output: None,
+        };
+        assert!(is_subagent_tool(&subagent_tool));
+        assert!(!is_planning_tool(&subagent_tool));
     }
 }

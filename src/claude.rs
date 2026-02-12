@@ -183,7 +183,8 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
 
     let session_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let project_dir = path.parent();
-    let tool_results_dir = project_dir.map(|p| p.join(&session_id).join("tool-results"));
+    let session_dir = project_dir.map(|p| p.join(&session_id));
+    let tool_results_dir = session_dir.as_ref().map(|p| p.join("tool-results"));
 
     let mut entries: Vec<Value> = Vec::new();
     for line in reader.lines() {
@@ -197,7 +198,7 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     }
 
     // Build turns by pairing user messages with assistant responses
-    let turns = build_turns(&entries, tool_results_dir.as_deref(), project_dir);
+    let turns = build_turns(&entries, tool_results_dir.as_deref(), session_dir.as_deref());
 
     // Extract session metadata
     let version = entries
@@ -221,7 +222,7 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     })
 }
 
-fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, project_dir: Option<&Path>) -> Vec<Turn> {
+fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: Option<&Path>) -> Vec<Turn> {
     let mut turns = Vec::new();
     let mut i = 0;
 
@@ -263,7 +264,7 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, project_dir: 
                         &mut pending_tool_uses,
                         &mut tool_invocations,
                         tool_results_dir,
-                        project_dir,
+                        session_dir,
                     );
                     i += 1;
                     continue;
@@ -312,7 +313,7 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, project_dir: 
                     // Find the corresponding tool use in pending
                     if let Some(tool_id) = find_tool_id_for_result(next_entry) {
                         if let Some(tool_use) = pending_tool_uses.remove(&tool_id) {
-                            let invocation = create_tool_invocation(&tool_id, &tool_use, Some(tool_result), tool_results_dir, project_dir);
+                            let invocation = create_tool_invocation(&tool_id, &tool_use, Some(tool_result), tool_results_dir, session_dir);
                             tool_invocations.push(invocation);
                         }
                     }
@@ -324,7 +325,7 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, project_dir: 
 
         // Add any remaining tool uses without results
         for (tool_id, tool_use) in pending_tool_uses {
-            let invocation = create_tool_invocation(&tool_id, &tool_use, None, tool_results_dir, project_dir);
+            let invocation = create_tool_invocation(&tool_id, &tool_use, None, tool_results_dir, session_dir);
             tool_invocations.push(invocation);
         }
 
@@ -382,7 +383,7 @@ fn process_tool_results(
     pending_tool_uses: &mut HashMap<String, Value>,
     tool_invocations: &mut Vec<ToolInvocation>,
     tool_results_dir: Option<&Path>,
-    project_dir: Option<&Path>,
+    session_dir: Option<&Path>,
 ) {
     // Check for top-level toolUseResult (has agentId for Task tools)
     let entry_tool_use_result = entry.get("toolUseResult");
@@ -397,7 +398,7 @@ fn process_tool_results(
             if let Some(tool_use) = pending_tool_uses.remove(tool_id) {
                 // Prefer entry's toolUseResult (has agentId), fall back to item content
                 let result = entry_tool_use_result.or_else(|| item.get("content"));
-                let invocation = create_tool_invocation(tool_id, &tool_use, result, tool_results_dir, project_dir);
+                let invocation = create_tool_invocation(tool_id, &tool_use, result, tool_results_dir, session_dir);
                 tool_invocations.push(invocation);
             }
         }
@@ -421,12 +422,12 @@ fn create_tool_invocation(
     tool_use: &Value,
     result: Option<&Value>,
     tool_results_dir: Option<&Path>,
-    project_dir: Option<&Path>,
+    session_dir: Option<&Path>,
 ) -> ToolInvocation {
     let tool_name = tool_use.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
     let input = tool_use.get("input").cloned().unwrap_or(Value::Null);
 
-    let (tool_type, input_display, output_display) = parse_tool_type(tool_name, &input, result, tool_id, tool_results_dir, project_dir);
+    let (tool_type, input_display, output_display) = parse_tool_type(tool_name, &input, result, tool_id, tool_results_dir, session_dir);
 
     ToolInvocation {
         id: tool_id.to_string(),
@@ -444,7 +445,7 @@ fn parse_tool_type(
     result: Option<&Value>,
     tool_id: &str,
     tool_results_dir: Option<&Path>,
-    project_dir: Option<&Path>,
+    session_dir: Option<&Path>,
 ) -> (ToolType, String, String) {
     match tool_name {
         "Read" => {
@@ -640,12 +641,8 @@ fn parse_tool_type(
 
             // Load subagent turns if we have an agentId
             let subagent_turns = agent_id
-                .and_then(|id| {
-                    project_dir.and_then(|dir| {
-                        let agent_file = dir.join(format!("agent-{id}.jsonl"));
-                        parse_agent_file(&agent_file).ok()
-                    })
-                })
+                .as_deref()
+                .and_then(|id| load_subagent_turns(id, session_dir))
                 .unwrap_or_default();
 
             let input_display = format!("{}\n{}", description, truncate_display(&prompt, 200));
@@ -803,6 +800,30 @@ fn extract_agent_id(result: &str) -> Option<String> {
             }
         }
     }
+    None
+}
+
+/// Load subagent turns from the current Claude layout first, then legacy layout.
+///
+/// Current: `<project>/<session-id>/subagents/agent-{id}.jsonl`
+/// Legacy: `<project>/agent-{id}.jsonl`
+fn load_subagent_turns(agent_id: &str, session_dir: Option<&Path>) -> Option<Vec<Turn>> {
+    let session_dir = session_dir?;
+
+    let current_path = session_dir
+        .join("subagents")
+        .join(format!("agent-{agent_id}.jsonl"));
+    if current_path.exists() {
+        return parse_agent_file(&current_path).ok();
+    }
+
+    if let Some(project_dir) = session_dir.parent() {
+        let legacy_path = project_dir.join(format!("agent-{agent_id}.jsonl"));
+        if legacy_path.exists() {
+            return parse_agent_file(&legacy_path).ok();
+        }
+    }
+
     None
 }
 
@@ -1089,6 +1110,114 @@ mod tests {
         } else {
             panic!("Expected Task tool type");
         }
+    }
+
+    #[test]
+    fn test_parse_session_loads_subagent_from_session_subagents_dir() {
+        use std::io::Write;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("promptui_test_subagents_{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let session_id = "session-123";
+        let agent_id = "atest123";
+        let session_path = root.join(format!("{session_id}.jsonl"));
+        let subagents_dir = root.join(session_id).join("subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+
+        let mut subagent_file = std::fs::File::create(
+            subagents_dir.join(format!("agent-{agent_id}.jsonl")),
+        ).unwrap();
+        writeln!(
+            subagent_file,
+            "{}",
+            json!({
+                "type": "user",
+                "uuid": "sub-u",
+                "message": {"role": "user", "content": "Investigate"}
+            })
+        ).unwrap();
+        writeln!(
+            subagent_file,
+            "{}",
+            json!({
+                "type": "assistant",
+                "uuid": "sub-a",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}
+            })
+        ).unwrap();
+        drop(subagent_file);
+
+        let mut session_file = std::fs::File::create(&session_path).unwrap();
+        writeln!(
+            session_file,
+            "{}",
+            json!({
+                "type": "user",
+                "uuid": "u1",
+                "message": {"role": "user", "content": "Run a task"}
+            })
+        ).unwrap();
+        writeln!(
+            session_file,
+            "{}",
+            json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_task_1",
+                        "name": "Task",
+                        "input": {
+                            "description": "Test task",
+                            "prompt": "Do work",
+                            "subagent_type": "Explore"
+                        }
+                    }]
+                }
+            })
+        ).unwrap();
+        writeln!(
+            session_file,
+            "{}",
+            json!({
+                "type": "user",
+                "uuid": "u2",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_task_1",
+                        "content": "ok"
+                    }]
+                },
+                "toolUseResult": {
+                    "agentId": agent_id,
+                    "content": [{"type": "text", "text": "agent complete"}]
+                }
+            })
+        ).unwrap();
+        drop(session_file);
+
+        let session = parse_session(&session_path).expect("session should parse");
+        let subagent_turn_count = session
+            .turns
+            .iter()
+            .flat_map(|t| t.tool_invocations.iter())
+            .find_map(|tool| match &tool.tool_type {
+                ToolType::Task { subagent_turns, .. } => Some(subagent_turns.len()),
+                _ => None,
+            });
+
+        assert_eq!(subagent_turn_count, Some(1));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
