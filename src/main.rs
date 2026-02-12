@@ -5,10 +5,10 @@ mod share;
 
 use std::fmt::Write as _;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use color_eyre::Result;
+use color_eyre::{eyre::eyre, Result};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
@@ -41,6 +41,13 @@ const SEARCH_HIGHLIGHT_BG: Color = Color::Indexed(238);
 const SEARCH_CURRENT_BG: Color = Color::Yellow;
 /// Foreground color for the current/active search match
 const SEARCH_CURRENT_FG: Color = Color::Black;
+
+#[derive(Debug, Clone)]
+enum CliCommand {
+    Browse,
+    Import(PathBuf),
+    Help,
+}
 
 // =============================================================================
 // Unified Types
@@ -591,6 +598,17 @@ impl App {
             content_lines: Vec::new(),
             search: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_open_session(session: Session) -> Self {
+        let mut app = Self::new();
+        let context = TurnContext::new(session.name.clone(), session.turns.clone());
+        app.view = View::SessionViewer;
+        app.session = Some(session);
+        app.current_session_index = None;
+        app.context_stack = vec![context];
+        app
     }
 
     /// Get the current (top) context
@@ -1774,8 +1792,11 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                     File: {location}\n\n\
                     Resumable: {}\n\
                     (Path copied to clipboard)\n\n\
+                    To open this file on another machine:\n\
+                    {}\n\n\
                     Press any key to close",
-                    if *resumable { "yes" } else { "no" }
+                    if *resumable { "yes" } else { "no" },
+                    share_import_command(location),
                 ),
                 Style::default().fg(Color::Green),
             ),
@@ -1878,10 +1899,12 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .saturating_sub(12 + id_width + time_width + source_width + project_width)
         .max(10);
 
-    let title = format!(
-        " Sessions ({}) - Enter: open | R: resume | u: share | q: quit ",
-        app.sessions.len()
-    );
+    let can_resume = app
+        .session_list_state
+        .selected()
+        .and_then(|i| app.sessions.get(i))
+        .is_some();
+    let title = browser_title(app.sessions.len(), can_resume);
 
     // Render header line and list
     let chunks = Layout::default()
@@ -1966,7 +1989,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         (status, Style::default().fg(Color::Yellow))
     } else {
         (
-            " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search | R: Resume | u: Share | q: Quit ".to_string(),
+            browser_help_text(can_resume),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1993,6 +2016,31 @@ fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+fn browser_title(session_count: usize, can_resume: bool) -> String {
+    let resume = if can_resume { " | R: resume" } else { "" };
+    format!(" Sessions ({session_count}) - Enter: open{resume} | u: share | q: quit ")
+}
+
+fn browser_help_text(can_resume: bool) -> String {
+    let resume = if can_resume { " | R: Resume" } else { "" };
+    format!(
+        " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search{resume} | u: Share | q: Quit "
+    )
+}
+
+fn viewer_help_text(is_subagent_view: bool, can_resume: bool) -> String {
+    let resume = if can_resume { " | R: Resume" } else { "" };
+    if is_subagent_view {
+        format!(
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy{resume} | Esc: Back | q: Quit "
+        )
+    } else {
+        format!(
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy{resume} | Enter: Open | q: Quit "
+        )
+    }
 }
 
 fn render_session_viewer(frame: &mut Frame, app: &mut App) {
@@ -2060,6 +2108,10 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
+    let can_resume = app
+        .current_session_index
+        .and_then(|i| app.sessions.get(i))
+        .is_some();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2184,12 +2236,12 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     } else if app.is_subagent_view() {
         (
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy | R: Resume | Esc: Back | q: Quit ".to_string(),
+            viewer_help_text(true, can_resume),
             Style::default().fg(Color::DarkGray),
         )
     } else {
         (
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy | R: Resume | Enter: Open | q: Quit ".to_string(),
+            viewer_help_text(false, can_resume),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -2904,6 +2956,34 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
     Text::from(lines)
 }
 
+fn usage_text(bin: &str) -> String {
+    format!("Usage:\n  {bin}\n  {bin} import <shared-session.json.zst>\n  {bin} --help")
+}
+
+fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
+    let bin = args.first().map_or("vibereview", String::as_str);
+    match args {
+        [_] => Ok(CliCommand::Browse),
+        [_, flag] if flag == "-h" || flag == "--help" => Ok(CliCommand::Help),
+        [_, cmd, path] if cmd == "import" => Ok(CliCommand::Import(PathBuf::from(path))),
+        _ => Err(eyre!("Invalid arguments.\n\n{}", usage_text(bin))),
+    }
+}
+
+fn load_imported_session(path: &Path) -> Result<Session> {
+    let shared = share::read_share_file_from_path(path)
+        .map_err(|e| eyre!("Failed to read shared file {}: {e}", path.display()))?;
+    Ok(shared.session)
+}
+
+fn shell_quote_arg(arg: &str) -> String {
+    format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn share_import_command(path: &str) -> String {
+    format!("vibereview import {}", shell_quote_arg(path))
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -2911,12 +2991,28 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
 fn main() -> Result<()> {
     color_eyre::install()?;
 
+    let args: Vec<String> = std::env::args().collect();
+    let command = parse_cli_command(&args)?;
+    if matches!(command, CliCommand::Help) {
+        let bin = args.first().map_or("vibereview", String::as_str);
+        println!("{}", usage_text(bin));
+        return Ok(());
+    }
+
+    let imported_session = match command {
+        CliCommand::Import(path) => Some(load_imported_session(&path)?),
+        CliCommand::Browse | CliCommand::Help => None,
+    };
+
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
-    let mut app = App::new();
+    let mut app = match imported_session {
+        Some(session) => App::with_open_session(session),
+        None => App::new(),
+    };
 
     while !app.should_quit {
         terminal.draw(|frame| ui(frame, &mut app))?;
@@ -3404,5 +3500,48 @@ mod tests {
         };
         assert!(is_subagent_tool(&subagent_tool));
         assert!(!is_planning_tool(&subagent_tool));
+    }
+
+    #[test]
+    fn test_parse_cli_command_defaults_to_browse() {
+        let args = vec!["vibereview".to_string()];
+        let parsed = parse_cli_command(&args).unwrap();
+        assert!(matches!(parsed, CliCommand::Browse));
+    }
+
+    #[test]
+    fn test_parse_cli_command_import() {
+        let args = vec![
+            "vibereview".to_string(),
+            "import".to_string(),
+            "/tmp/share.json.zst".to_string(),
+        ];
+        let parsed = parse_cli_command(&args).unwrap();
+        match parsed {
+            CliCommand::Import(path) => {
+                assert_eq!(path.display().to_string(), "/tmp/share.json.zst")
+            }
+            _ => panic!("expected import command"),
+        }
+    }
+
+    #[test]
+    fn test_share_import_command_quotes_path() {
+        let cmd = share_import_command("/tmp/session file.json.zst");
+        assert_eq!(cmd, "vibereview import \"/tmp/session file.json.zst\"");
+    }
+
+    #[test]
+    fn test_browser_help_text_hides_resume_when_unavailable() {
+        assert!(!browser_help_text(false).contains("R: Resume"));
+        assert!(browser_help_text(true).contains("R: Resume"));
+    }
+
+    #[test]
+    fn test_viewer_help_text_hides_resume_when_unavailable() {
+        assert!(!viewer_help_text(false, false).contains("R: Resume"));
+        assert!(!viewer_help_text(true, false).contains("R: Resume"));
+        assert!(viewer_help_text(false, true).contains("R: Resume"));
+        assert!(viewer_help_text(true, true).contains("R: Resume"));
     }
 }

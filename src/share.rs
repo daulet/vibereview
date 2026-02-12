@@ -189,6 +189,12 @@ pub fn read_share_file(data: &[u8]) -> Result<PortableSharedFile> {
     Ok(serde_json::from_slice(&json)?)
 }
 
+/// Read and decode a portable share payload from disk.
+pub fn read_share_file_from_path(path: &Path) -> Result<PortableSharedFile> {
+    let data = fs::read(path)?;
+    read_share_file(&data)
+}
+
 fn filter_session(session: &Session, mode: ShareExportMode) -> Session {
     let turns = session
         .turns
