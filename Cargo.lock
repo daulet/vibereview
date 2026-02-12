@@ -2282,6 +2282,7 @@ name = "vibereview"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64",
  "chrono",
  "color-eyre",
  "crossterm",

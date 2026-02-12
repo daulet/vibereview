@@ -10,10 +10,14 @@ use std::time::Instant;
 
 use color_eyre::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use pulldown_cmark::{Event as MdEvent, Parser, Tag, TagEnd};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     prelude::CrosstermBackend,
@@ -22,7 +26,6 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame, Terminal,
 };
-use pulldown_cmark::{Event as MdEvent, Parser, Tag, TagEnd};
 
 use claude::{list_projects, list_sessions, parse_session};
 use codex::{list_codex_projects, list_codex_sessions_for_project, parse_codex_session};
@@ -49,24 +52,58 @@ pub enum Source {
     Codex,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareTarget {
+    File,
+    Cloud,
+}
+
+impl ShareTarget {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::File => "File export",
+            Self::Cloud => "Cloud link",
+        }
+    }
+}
+
 /// State of the upload operation
 #[derive(Debug, Clone)]
 pub enum UploadState {
     Idle,
-    Confirming,
-    Compressing,
-    Uploading,
-    Complete { url: String },
-    Error { message: String },
+    Confirming {
+        target: ShareTarget,
+        mode: share::ShareExportMode,
+        cloud_api_url: Option<String>,
+    },
+    Compressing {
+        target: ShareTarget,
+    },
+    Uploading {
+        target: ShareTarget,
+    },
+    Complete {
+        target: ShareTarget,
+        location: String,
+        resumable: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum ResumeState {
     Idle,
     /// Confirming resume with the command to be copied
-    Confirming { command: String },
+    Confirming {
+        command: String,
+    },
     /// Resume command copied to clipboard
-    Complete { command: String },
+    Complete {
+        command: String,
+    },
 }
 
 /// A unified session that can come from either source.
@@ -94,11 +131,13 @@ impl UnifiedSession {
     /// Get the session ID to use for resuming (most recent session file).
     /// For Claude: returns the full filename stem (UUID)
     /// For Codex: extracts just the UUID from "rollout-DATE-UUID" format
-    #[must_use] 
+    #[must_use]
     pub fn resume_session_id(&self) -> String {
-        let filename = self.paths
+        let filename = self
+            .paths
             .last()
-            .and_then(|p| p.file_stem()).map_or_else(|| self.name.clone(), |s| s.to_string_lossy().to_string());
+            .and_then(|p| p.file_stem())
+            .map_or_else(|| self.name.clone(), |s| s.to_string_lossy().to_string());
 
         match self.source {
             Source::Claude => filename,
@@ -108,7 +147,10 @@ impl UnifiedSession {
                 let parts: Vec<&str> = filename.rsplitn(6, '-').collect();
                 if parts.len() >= 5 {
                     // parts are reversed, so join them back in correct order
-                    format!("{}-{}-{}-{}-{}", parts[4], parts[3], parts[2], parts[1], parts[0])
+                    format!(
+                        "{}-{}-{}-{}-{}",
+                        parts[4], parts[3], parts[2], parts[1], parts[0]
+                    )
                 } else {
                     filename
                 }
@@ -117,7 +159,7 @@ impl UnifiedSession {
     }
 
     /// Get the command to resume this session.
-    #[must_use] 
+    #[must_use]
     pub fn get_resume_command(&self) -> String {
         let session_id = self.resume_session_id();
         let project_path = self.project_path.display();
@@ -421,7 +463,9 @@ impl TurnContext {
     }
 
     fn selected_turn(&self) -> Option<&Turn> {
-        self.turn_list_state.selected().and_then(|i| self.turns.get(i))
+        self.turn_list_state
+            .selected()
+            .and_then(|i| self.turns.get(i))
     }
 
     fn selected_tool(&self) -> Option<&ToolInvocation> {
@@ -433,7 +477,7 @@ impl TurnContext {
 /// What was copied to clipboard
 #[derive(Debug, Clone)]
 pub enum CopySource {
-    Tab(String),      // Tab name: "Prompt", "Thinking", "Tool Calls", "Diff"
+    Tab(String), // Tab name: "Prompt", "Thinking", "Tool Calls", "Diff"
     Prompt,
     Response,
     Selection,
@@ -485,7 +529,6 @@ impl TextSelection {
             (self.end, self.start)
         }
     }
-
 }
 
 pub struct App {
@@ -523,7 +566,7 @@ impl Default for App {
 }
 
 impl App {
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         let sessions = list_all_sessions();
         let mut session_list_state = ListState::default();
@@ -551,7 +594,7 @@ impl App {
     }
 
     /// Get the current (top) context
-    #[must_use] 
+    #[must_use]
     pub fn current_context(&self) -> Option<&TurnContext> {
         self.context_stack.last()
     }
@@ -562,13 +605,13 @@ impl App {
     }
 
     /// Check if we're in a subagent view (depth > 1)
-    #[must_use] 
+    #[must_use]
     pub const fn is_subagent_view(&self) -> bool {
         self.context_stack.len() > 1
     }
 
     /// Get the breadcrumb path
-    #[must_use] 
+    #[must_use]
     pub fn breadcrumb(&self) -> String {
         self.context_stack
             .iter()
@@ -582,7 +625,13 @@ impl App {
             return;
         }
         let i = match state.selected() {
-            Some(i) => if i >= len - 1 { 0 } else { i + 1 },
+            Some(i) => {
+                if i >= len - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
             None => 0,
         };
         state.select(Some(i));
@@ -593,7 +642,13 @@ impl App {
             return;
         }
         let i = match state.selected() {
-            Some(i) => if i == 0 { len - 1 } else { i - 1 },
+            Some(i) => {
+                if i == 0 {
+                    len - 1
+                } else {
+                    i - 1
+                }
+            }
             None => 0,
         };
         state.select(Some(i));
@@ -625,18 +680,37 @@ impl App {
     }
 
     fn handle_upload_key(&mut self, key: KeyCode) {
-        match &self.upload_state {
-            UploadState::Confirming => {
+        match self.upload_state.clone() {
+            UploadState::Confirming {
+                mut target,
+                mut mode,
+                cloud_api_url,
+            } => {
                 match key {
+                    KeyCode::Char('c') => {
+                        if cloud_api_url.is_some() {
+                            target = ShareTarget::Cloud;
+                        }
+                    }
+                    KeyCode::Char('f') => target = ShareTarget::File,
+                    KeyCode::Char('1') => mode = share::ShareExportMode::PromptResponseOnly,
+                    KeyCode::Char('2') => mode = share::ShareExportMode::PromptResponseAndDiff,
+                    KeyCode::Char('3') => mode = share::ShareExportMode::FullSession,
                     KeyCode::Enter | KeyCode::Char('y') => {
-                        // Start upload
-                        self.perform_upload();
+                        self.perform_upload(target, mode, cloud_api_url.as_deref());
+                        return;
                     }
                     KeyCode::Esc | KeyCode::Char('n') => {
                         self.upload_state = UploadState::Idle;
+                        return;
                     }
                     _ => {}
                 }
+                self.upload_state = UploadState::Confirming {
+                    target,
+                    mode,
+                    cloud_api_url,
+                };
             }
             UploadState::Complete { .. } | UploadState::Error { .. } => {
                 // Any key dismisses the result
@@ -670,78 +744,162 @@ impl App {
         }
     }
 
-    fn perform_upload(&mut self) {
+    fn perform_upload(
+        &mut self,
+        target: ShareTarget,
+        mode: share::ShareExportMode,
+        cloud_api_url: Option<&str>,
+    ) {
+        let selected_session = self.selected_unified_session().cloned().or_else(|| {
+            self.current_session_index
+                .and_then(|i| self.sessions.get(i).cloned())
+        });
+
+        let Some(selected) = selected_session else {
+            self.upload_state = UploadState::Error {
+                message: "No session selected".to_string(),
+            };
+            return;
+        };
+
         let session = match &self.session {
             Some(s) => s.clone(),
-            None => {
-                // Try to load from selected session in browser
-                if let Some(i) = self.session_list_state.selected() {
-                    if let Some(session_info) = self.sessions.get(i) {
-                        match session_info.parse() {
-                            Ok(s) => s,
-                            Err(e) => {
-                                self.upload_state = UploadState::Error {
-                                    message: format!("Failed to parse session: {e}"),
-                                };
-                                return;
-                            }
-                        }
-                    } else {
-                        self.upload_state = UploadState::Error {
-                            message: "No session selected".to_string(),
-                        };
-                        return;
-                    }
-                } else {
+            None => match selected.parse() {
+                Ok(s) => s,
+                Err(e) => {
                     self.upload_state = UploadState::Error {
-                        message: "No session selected".to_string(),
+                        message: format!("Failed to parse session: {e}"),
                     };
                     return;
                 }
-            }
+            },
         };
 
-        self.upload_state = UploadState::Compressing;
+        self.upload_state = UploadState::Compressing { target };
 
-        // Compress the session
-        let compressed = match share::compress_session(&session) {
-            Ok(c) => c,
-            Err(e) => {
-                self.upload_state = UploadState::Error {
-                    message: format!("Compression failed: {e}"),
+        match target {
+            ShareTarget::Cloud => {
+                let Some(api_url) = cloud_api_url else {
+                    self.upload_state = UploadState::Error {
+                        message: format!(
+                            "Cloud share is not configured. Set {}.",
+                            share::SHARE_API_URL_ENV
+                        ),
+                    };
+                    return;
                 };
-                return;
-            }
-        };
 
-        self.upload_state = UploadState::Uploading;
-
-        // Upload to server
-        match share::upload_session(&compressed) {
-            Ok(response) => {
-                // Try to copy URL to clipboard
-                let _ = share::copy_to_clipboard(&response.url);
-                self.upload_state = UploadState::Complete { url: response.url };
-            }
-            Err(e) => {
-                self.upload_state = UploadState::Error {
-                    message: format!("Upload failed: {e}"),
+                let compressed = match share::compress_session(&session) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.upload_state = UploadState::Error {
+                            message: format!("Compression failed: {e}"),
+                        };
+                        return;
+                    }
                 };
+
+                self.upload_state = UploadState::Uploading { target };
+
+                match share::upload_session(&compressed, api_url) {
+                    Ok(response) => {
+                        let _ = share::copy_to_clipboard(&response.url);
+                        self.upload_state = UploadState::Complete {
+                            target,
+                            location: response.url,
+                            resumable: false,
+                        };
+                    }
+                    Err(e) => {
+                        self.upload_state = UploadState::Error {
+                            message: format!("Upload failed: {e}"),
+                        };
+                    }
+                }
+            }
+            ShareTarget::File => {
+                let resume_input = if mode.is_resumable() {
+                    Some(share::ResumeBundleInput {
+                        source: match selected.source {
+                            Source::Claude => share::ResumeSource::Claude,
+                            Source::Codex => share::ResumeSource::Codex,
+                        },
+                        resume_session_id: selected.resume_session_id(),
+                        resume_command: selected.get_resume_command(),
+                        project_path_hint: selected.project_path.clone(),
+                        session_paths: selected.paths.clone(),
+                    })
+                } else {
+                    None
+                };
+
+                let compressed =
+                    match share::build_share_file(&session, mode, resume_input.as_ref()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.upload_state = UploadState::Error {
+                                message: format!("Export failed: {e}"),
+                            };
+                            return;
+                        }
+                    };
+
+                self.upload_state = UploadState::Uploading { target };
+
+                let path = share::default_share_file_path(&selected.name, mode);
+                match share::write_share_file(&path, &compressed) {
+                    Ok(()) => {
+                        let path_str = path.display().to_string();
+                        let _ = share::copy_to_clipboard(&path_str);
+                        self.upload_state = UploadState::Complete {
+                            target,
+                            location: path_str,
+                            resumable: mode.is_resumable(),
+                        };
+                    }
+                    Err(e) => {
+                        self.upload_state = UploadState::Error {
+                            message: format!("Save failed: {e}"),
+                        };
+                    }
+                }
             }
         }
+    }
+
+    fn selected_unified_session(&self) -> Option<&UnifiedSession> {
+        if let Some(i) = self.current_session_index {
+            return self.sessions.get(i);
+        }
+        self.session_list_state
+            .selected()
+            .and_then(|i| self.sessions.get(i))
     }
 
     fn handle_session_browser_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('u') => {
-                // Upload selected session
+                // Share selected session
                 if self.session_list_state.selected().is_some() {
-                    self.upload_state = UploadState::Confirming;
+                    let cloud_api_url = share::cloud_share_api_url();
+                    self.upload_state = UploadState::Confirming {
+                        target: if cloud_api_url.is_some() {
+                            ShareTarget::Cloud
+                        } else {
+                            ShareTarget::File
+                        },
+                        mode: share::ShareExportMode::FullSession,
+                        cloud_api_url,
+                    };
                 }
             }
-            KeyCode::Up => Self::select_prev_in_list(&mut self.session_list_state, self.sessions.len()),
-            KeyCode::Down => Self::select_next_in_list(&mut self.session_list_state, self.sessions.len()),
+            KeyCode::Up => {
+                Self::select_prev_in_list(&mut self.session_list_state, self.sessions.len())
+            }
+            KeyCode::Down => {
+                Self::select_next_in_list(&mut self.session_list_state, self.sessions.len())
+            }
             KeyCode::PageUp => {
                 let len = self.sessions.len();
                 for _ in 0..10 {
@@ -759,10 +917,8 @@ impl App {
                     if let Some(session_info) = self.sessions.get(i) {
                         match session_info.parse() {
                             Ok(session) => {
-                                let context = TurnContext::new(
-                                    session.name.clone(),
-                                    session.turns.clone(),
-                                );
+                                let context =
+                                    TurnContext::new(session.name.clone(), session.turns.clone());
                                 self.session = Some(session);
                                 self.current_session_index = Some(i);
                                 self.context_stack = vec![context];
@@ -797,7 +953,16 @@ impl App {
             KeyCode::Char('S') => {
                 // Share current session
                 if self.session.is_some() {
-                    self.upload_state = UploadState::Confirming;
+                    let cloud_api_url = share::cloud_share_api_url();
+                    self.upload_state = UploadState::Confirming {
+                        target: if cloud_api_url.is_some() {
+                            ShareTarget::Cloud
+                        } else {
+                            ShareTarget::File
+                        },
+                        mode: share::ShareExportMode::FullSession,
+                        cloud_api_url,
+                    };
                 }
             }
             KeyCode::Esc => {
@@ -842,8 +1007,8 @@ impl App {
             KeyCode::Char('j') => {
                 if let Some(ctx) = self.current_context_mut() {
                     if ctx.active_tab == DetailTab::ToolCalls {
-                        let tool_count = ctx.selected_turn()
-                            .map_or(0, |t| t.tool_invocations.len());
+                        let tool_count =
+                            ctx.selected_turn().map_or(0, |t| t.tool_invocations.len());
                         if ctx.tool_scroll_offset < tool_count.saturating_sub(1) {
                             ctx.tool_scroll_offset += 1;
                         }
@@ -938,9 +1103,18 @@ impl App {
                 return None;
             }
             ctx.selected_tool().and_then(|tool| {
-                if let ToolType::Task { subagent_turns, subagent_type, description, .. } = &tool.tool_type {
+                if let ToolType::Task {
+                    subagent_turns,
+                    subagent_type,
+                    description,
+                    ..
+                } = &tool.tool_type
+                {
                     if !subagent_turns.is_empty() {
-                        let title = subagent_type.as_deref().unwrap_or(description.as_str()).to_string();
+                        let title = subagent_type
+                            .as_deref()
+                            .unwrap_or(description.as_str())
+                            .to_string();
                         return Some((title, subagent_turns.clone()));
                     }
                 }
@@ -976,19 +1150,24 @@ impl App {
 
     fn search_lines_for_scope(&self, scope: SearchScope) -> Vec<String> {
         match scope {
-            SearchScope::SessionList => self.sessions.iter().map(|s| {
-                let desc = s.description.as_deref().unwrap_or(&s.name);
-                format!("{} {} {}", s.name, s.project, desc)
-            }).collect(),
-            SearchScope::TurnList => {
-                self.current_context()
-                    .map(|ctx| {
-                        ctx.turns.iter().enumerate().map(|(i, t)| {
-                            format!("{} {}", i + 1, t.user_prompt)
-                        }).collect()
-                    })
-                    .unwrap_or_default()
-            }
+            SearchScope::SessionList => self
+                .sessions
+                .iter()
+                .map(|s| {
+                    let desc = s.description.as_deref().unwrap_or(&s.name);
+                    format!("{} {} {}", s.name, s.project, desc)
+                })
+                .collect(),
+            SearchScope::TurnList => self
+                .current_context()
+                .map(|ctx| {
+                    ctx.turns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| format!("{} {}", i + 1, t.user_prompt))
+                        .collect()
+                })
+                .unwrap_or_default(),
             SearchScope::Content => {
                 if self.content_lines.is_empty() {
                     self.get_copyable_content()
@@ -1028,7 +1207,10 @@ impl App {
                 if let Some(found) = lower[start..].find(&q) {
                     let byte_col = start + found;
                     let col = byte_to_char_idx(line, byte_col);
-                    search.hits.push(SearchHit { line: line_idx, col });
+                    search.hits.push(SearchHit {
+                        line: line_idx,
+                        col,
+                    });
                     start = byte_col + q.len().max(1);
                 } else {
                     break;
@@ -1040,7 +1222,8 @@ impl App {
     fn apply_search_hit(&mut self) {
         let (scope, hit_opt) = match &self.search {
             Some(search) if !search.hits.is_empty() => {
-                let hit = search.hits[search.cursor.min(search.hits.len().saturating_sub(1))].clone();
+                let hit =
+                    search.hits[search.cursor.min(search.hits.len().saturating_sub(1))].clone();
                 (search.scope, Some(hit))
             }
             _ => (SearchScope::Content, None),
@@ -1161,30 +1344,30 @@ impl App {
                 Some(content)
             }
             DetailTab::Thinking => turn.thinking.clone(),
-            DetailTab::ToolCalls => {
-                ctx.selected_tool().map(|tool| {
-                    let tool_kind = if is_subagent_tool(tool) {
-                        "subagent"
-                    } else if is_planning_tool(tool) {
-                        "planning"
-                    } else {
-                        "regular"
-                    };
-                    format!(
-                        "Tool: {} ({})\n\nInput:\n{}\n\nOutput:\n{}",
-                        tool.tool_type.name(),
-                        tool_kind,
-                        tool.input_display,
-                        tool.output_display
-                    )
-                })
-            }
+            DetailTab::ToolCalls => ctx.selected_tool().map(|tool| {
+                let tool_kind = if is_subagent_tool(tool) {
+                    "subagent"
+                } else if is_planning_tool(tool) {
+                    "planning"
+                } else {
+                    "regular"
+                };
+                format!(
+                    "Tool: {} ({})\n\nInput:\n{}\n\nOutput:\n{}",
+                    tool.tool_type.name(),
+                    tool_kind,
+                    tool.input_display,
+                    tool.output_display
+                )
+            }),
             DetailTab::Diff => {
                 let mut diffs = String::new();
                 for tool in &turn.tool_invocations {
                     if let Some(diff) = tool.tool_type.diff() {
                         let path = match &tool.tool_type {
-                            ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+                            ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => {
+                                path.clone()
+                            }
                             _ => "unknown".to_string(),
                         };
                         let _ = writeln!(diffs, "--- {path} ---\n{diff}\n");
@@ -1221,19 +1404,27 @@ impl App {
         for tool in &turn.tool_invocations {
             if let Some(diff) = tool.tool_type.diff() {
                 let path = match &tool.tool_type {
-                    ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+                    ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => {
+                        path.clone()
+                    }
                     _ => "unknown".to_string(),
                 };
                 let _ = writeln!(diffs, "--- {path} ---\n{diff}\n");
             }
-            if let ToolType::Task { subagent_turns, subagent_type, .. } = &tool.tool_type {
+            if let ToolType::Task {
+                subagent_turns,
+                subagent_type,
+                ..
+            } = &tool.tool_type
+            {
                 if !subagent_turns.is_empty() {
                     let prefix = format!("[{}]", subagent_type.as_deref().unwrap_or("subagent"));
                     for subturn in subagent_turns {
                         for subtool in &subturn.tool_invocations {
                             if let Some(subdiff) = subtool.tool_type.diff() {
                                 let path = match &subtool.tool_type {
-                                    ToolType::FileEdit { path, .. } | ToolType::FileWrite { path, .. } => path.clone(),
+                                    ToolType::FileEdit { path, .. }
+                                    | ToolType::FileWrite { path, .. } => path.clone(),
                                     _ => "unknown".to_string(),
                                 };
                                 let _ = writeln!(diffs, "--- {prefix} {path} ---\n{subdiff}\n");
@@ -1308,8 +1499,12 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(ref mut selection) = self.text_selection {
                     // Update selection end - clamp to content area
-                    let rel_x = x.saturating_sub(content_area.x).min(content_area.width.saturating_sub(1));
-                    let rel_y = y.saturating_sub(content_area.y).min(content_area.height.saturating_sub(1));
+                    let rel_x = x
+                        .saturating_sub(content_area.x)
+                        .min(content_area.width.saturating_sub(1));
+                    let rel_y = y
+                        .saturating_sub(content_area.y)
+                        .min(content_area.height.saturating_sub(1));
                     selection.end = (rel_y, rel_x);
                 }
             }
@@ -1370,7 +1565,11 @@ impl App {
             let line = &self.content_lines[line_idx];
             let chars: Vec<char> = line.chars().collect();
 
-            let line_start = if rel_row == start_row { start_col as usize } else { 0 };
+            let line_start = if rel_row == start_row {
+                start_col as usize
+            } else {
+                0
+            };
             let line_end = if rel_row == end_row {
                 (end_col as usize + 1).min(chars.len())
             } else {
@@ -1378,7 +1577,9 @@ impl App {
             };
 
             if line_start < chars.len() {
-                let selected: String = chars[line_start..line_end.min(chars.len())].iter().collect();
+                let selected: String = chars[line_start..line_end.min(chars.len())]
+                    .iter()
+                    .collect();
                 result.push_str(&selected);
             }
 
@@ -1429,8 +1630,8 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
     // Create centered modal area
-    let modal_width = 60.min(area.width.saturating_sub(4));
-    let modal_height = 10.min(area.height.saturating_sub(4));
+    let modal_width = 72.min(area.width.saturating_sub(4));
+    let modal_height = 18.min(area.height.saturating_sub(4));
     let modal_area = Rect {
         x: (area.width - modal_width) / 2,
         y: (area.height - modal_height) / 2,
@@ -1443,47 +1644,142 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
 
     let (title, content, style) = match &app.upload_state {
         UploadState::Idle => return,
-        UploadState::Confirming => {
-            let session_name = app.session.as_ref()
+        UploadState::Confirming {
+            target,
+            mode,
+            cloud_api_url,
+        } => {
+            let session_name = app
+                .session
+                .as_ref()
                 .map(|s| s.name.clone())
                 .or_else(|| {
-                    app.session_list_state.selected()
+                    app.session_list_state
+                        .selected()
                         .and_then(|i| app.sessions.get(i))
                         .map(|s| s.name.clone())
                 })
                 .unwrap_or_else(|| "Unknown".to_string());
+            let content = if cloud_api_url.is_some() {
+                if *target == ShareTarget::Cloud {
+                    format!(
+                        "Share \"{}\".\n\n\
+                        Destination:\n\
+                          c) Cloud link\n\
+                          f) File export\n\n\
+                        Selected destination: {}\n\n\
+                        Press Enter or 'y' to upload full session,\n\
+                        Esc or 'n' to cancel",
+                        truncate_str(&session_name, 36),
+                        target.label(),
+                    )
+                } else {
+                    let resumable_hint = if mode.is_resumable() {
+                        "Yes (includes resume artifacts)"
+                    } else {
+                        "No (redacted export)"
+                    };
+                    format!(
+                        "Share \"{}\".\n\n\
+                        Destination:\n\
+                          c) Cloud link\n\
+                          f) File export\n\n\
+                        Selected destination: {}\n\n\
+                        Choose export mode:\n\
+                          1) Prompt + response only\n\
+                          2) Prompt + response + diff\n\
+                          3) Full session (resumable)\n\n\
+                        Selected mode: {}\n\
+                        Resumable on another machine: {}\n\n\
+                        Press Enter or 'y' to export, Esc or 'n' to cancel",
+                        truncate_str(&session_name, 36),
+                        target.label(),
+                        mode.label(),
+                        resumable_hint
+                    )
+                }
+            } else {
+                let resumable_hint = if mode.is_resumable() {
+                    "Yes (includes resume artifacts)"
+                } else {
+                    "No (redacted export)"
+                };
+                format!(
+                    "Share \"{}\".\n\n\
+                    Cloud share is not configured.\n\
+                    Set {} to enable cloud links.\n\
+                    Falling back to file export.\n\n\
+                    Choose export mode:\n\
+                      1) Prompt + response only\n\
+                      2) Prompt + response + diff\n\
+                      3) Full session (resumable)\n\n\
+                    Selected mode: {}\n\
+                    Resumable on another machine: {}\n\n\
+                    Press Enter or 'y' to export, Esc or 'n' to cancel",
+                    truncate_str(&session_name, 36),
+                    share::SHARE_API_URL_ENV,
+                    mode.label(),
+                    resumable_hint
+                )
+            };
             (
                 " Share Session ",
-                format!(
-                    "Share \"{}\"?\n\n\
-                    This will upload the session to the cloud and\n\
-                    create a shareable link.\n\n\
-                    Press Enter or 'y' to confirm, Esc or 'n' to cancel",
-                    truncate_str(&session_name, 30)
-                ),
+                content,
                 Style::default().fg(Color::Yellow),
             )
         }
-        UploadState::Compressing => (
-            " Sharing... ",
-            "Compressing session...".to_string(),
-            Style::default().fg(Color::Cyan),
-        ),
-        UploadState::Uploading => (
-            " Sharing... ",
-            "Uploading to cloud...".to_string(),
-            Style::default().fg(Color::Cyan),
-        ),
-        UploadState::Complete { url } => (
-            " Share Complete ",
-            format!(
-                "Session shared successfully!\n\n\
-                URL: {url}\n\n\
-                (Copied to clipboard)\n\n\
-                Press any key to close"
+        UploadState::Compressing { target } => match target {
+            ShareTarget::Cloud => (
+                " Sharing... ",
+                "Compressing session...".to_string(),
+                Style::default().fg(Color::Cyan),
             ),
-            Style::default().fg(Color::Green),
-        ),
+            ShareTarget::File => (
+                " Exporting... ",
+                "Building share file...".to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        },
+        UploadState::Uploading { target } => match target {
+            ShareTarget::Cloud => (
+                " Sharing... ",
+                "Uploading to cloud...".to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+            ShareTarget::File => (
+                " Exporting... ",
+                "Saving file...".to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
+        },
+        UploadState::Complete {
+            target,
+            location,
+            resumable,
+        } => match target {
+            ShareTarget::Cloud => (
+                " Share Complete ",
+                format!(
+                    "Session shared successfully!\n\n\
+                    URL: {location}\n\n\
+                    (Copied to clipboard)\n\n\
+                    Press any key to close"
+                ),
+                Style::default().fg(Color::Green),
+            ),
+            ShareTarget::File => (
+                " Export Complete ",
+                format!(
+                    "Session exported successfully!\n\n\
+                    File: {location}\n\n\
+                    Resumable: {}\n\
+                    (Path copied to clipboard)\n\n\
+                    Press any key to close",
+                    if *resumable { "yes" } else { "no" }
+                ),
+                Style::default().fg(Color::Green),
+            ),
+        },
         UploadState::Error { message } => (
             " Share Failed ",
             format!(
@@ -1578,27 +1874,48 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let source_width = 6;
     let project_width = 16;
     // borders(2) + highlight(2) + spacing(4 separators * 2 = 8) = 12
-    let desc_width = (area.width as usize).saturating_sub(12 + id_width + time_width + source_width + project_width).max(10);
+    let desc_width = (area.width as usize)
+        .saturating_sub(12 + id_width + time_width + source_width + project_width)
+        .max(10);
 
-    let title = format!(" Sessions ({}) - Enter: open | R: resume | u: share | q: quit ", app.sessions.len());
+    let title = format!(
+        " Sessions ({}) - Enter: open | R: resume | u: share | q: quit ",
+        app.sessions.len()
+    );
 
     // Render header line and list
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     let header = format!(
         "  {:<id_w$}  {:<time_w$}  {:<src_w$}  {:<proj_w$}  {}",
-        "ID", "TIME", "SOURCE", "PROJECT", "DESCRIPTION",
+        "ID",
+        "TIME",
+        "SOURCE",
+        "PROJECT",
+        "DESCRIPTION",
         id_w = id_width,
         time_w = time_width,
         src_w = source_width,
         proj_w = project_width
     );
     let header_para = Paragraph::new(header)
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .block(Block::default().borders(Borders::TOP | Borders::LEFT | Borders::RIGHT).title(title));
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+                .title(title),
+        );
     frame.render_widget(header_para, chunks[0]);
 
     let items: Vec<ListItem> = app
@@ -1666,7 +1983,9 @@ fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
             let hours_ago = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|n| n.as_secs())
-                .unwrap_or(secs) - secs) / 3600;
+                .unwrap_or(secs)
+                - secs)
+                / 3600;
             if hours_ago < 24 {
                 format!("{hours_ago}h ago")
             } else {
@@ -1700,7 +2019,8 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, turn)| {
-            let prompt_preview: String = turn.user_prompt
+            let prompt_preview: String = turn
+                .user_prompt
                 .chars()
                 .take(40)
                 .collect::<String>()
@@ -1718,7 +2038,11 @@ fn render_turn_list(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let title = if is_subagent {
-        format!(" {} ({} turns) - Esc to go back ", ctx.title, ctx.turns.len())
+        format!(
+            " {} ({} turns) - Esc to go back ",
+            ctx.title,
+            ctx.turns.len()
+        )
     } else {
         format!(" Turns ({}) - Esc to go back ", ctx.turns.len())
     };
@@ -1753,7 +2077,9 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(breadcrumb, chunks[0]);
     }
 
-    let tab_area = if app.is_subagent_view() { chunks[1] } else {
+    let tab_area = if app.is_subagent_view() {
+        chunks[1]
+    } else {
         // Merge breadcrumb area into tab area when not in subagent
         Rect {
             y: chunks[0].y,
@@ -1802,17 +2128,25 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         };
 
         // Extract plain text lines for selection
-        let content_lines: Vec<String> = content.lines.iter()
-            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        let content_lines: Vec<String> = content
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect();
 
         // Apply selection highlighting if active
-        let content = apply_search_highlight(
+        let content = apply_search_highlight(content, app.search.as_ref(), ctx.active_tab);
+        let content = apply_selection_highlight(
             content,
-            app.search.as_ref(),
-            ctx.active_tab,
+            app.text_selection.as_ref(),
+            ctx.scroll_offset,
+            inner_content_area.width,
         );
-        let content = apply_selection_highlight(content, app.text_selection.as_ref(), ctx.scroll_offset, inner_content_area.width);
 
         let paragraph = Paragraph::new(content)
             .block(content_block)
@@ -1833,7 +2167,9 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // Help line - show "Copied!" feedback briefly, otherwise show help
-    let copy_feedback = app.copy_feedback.as_ref()
+    let copy_feedback = app
+        .copy_feedback
+        .as_ref()
         .filter(|f| f.timestamp.elapsed().as_millis() < 1500);
 
     let (help_text, help_style) = if let Some(feedback) = copy_feedback {
@@ -1863,7 +2199,12 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Apply selection highlighting to text content
-fn apply_selection_highlight(content: Text<'static>, selection: Option<&TextSelection>, scroll_offset: u16, _width: u16) -> Text<'static> {
+fn apply_selection_highlight(
+    content: Text<'static>,
+    selection: Option<&TextSelection>,
+    scroll_offset: u16,
+    _width: u16,
+) -> Text<'static> {
     let Some(sel) = selection else {
         return content;
     };
@@ -1895,8 +2236,16 @@ fn apply_selection_highlight(content: Text<'static>, selection: Option<&TextSele
             let span_end_col = current_col + span_len;
 
             // Determine selection range within this line
-            let line_sel_start = if line_idx == sel_start_line { start_col as usize } else { 0 };
-            let line_sel_end = if line_idx == sel_end_line { end_col as usize + 1 } else { usize::MAX };
+            let line_sel_start = if line_idx == sel_start_line {
+                start_col as usize
+            } else {
+                0
+            };
+            let line_sel_end = if line_idx == sel_end_line {
+                end_col as usize + 1
+            } else {
+                usize::MAX
+            };
 
             // Check if this span overlaps with selection
             if span_end_col <= line_sel_start || current_col >= line_sel_end {
@@ -1916,7 +2265,8 @@ fn apply_selection_highlight(content: Text<'static>, selection: Option<&TextSele
                 let sel_start_in_span = line_sel_start.saturating_sub(current_col);
                 let sel_end_in_span = (line_sel_end - current_col).min(span_len);
                 if sel_start_in_span < span_len {
-                    let selected: String = chars[sel_start_in_span..sel_end_in_span].iter().collect();
+                    let selected: String =
+                        chars[sel_start_in_span..sel_end_in_span].iter().collect();
                     new_spans.push(Span::styled(selected, highlight_style));
                 }
 
@@ -1965,7 +2315,11 @@ fn apply_search_highlight(
     let mut new_lines: Vec<Line<'static>> = Vec::new();
     for (line_idx, line) in content.lines.into_iter().enumerate() {
         let ranges = build_search_ranges(
-            &line.spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            &line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
             query,
             current_hit.filter(|(l, _)| *l == line_idx),
         );
@@ -1979,7 +2333,11 @@ fn apply_search_highlight(
     Text::from(new_lines)
 }
 
-fn build_search_ranges(line: &str, query: &str, current: Option<(usize, usize)>) -> Vec<(usize, usize, bool)> {
+fn build_search_ranges(
+    line: &str,
+    query: &str,
+    current: Option<(usize, usize)>,
+) -> Vec<(usize, usize, bool)> {
     let mut ranges = Vec::new();
     let line_lower = line.to_lowercase();
     let q_lower = query.to_lowercase();
@@ -2037,8 +2395,14 @@ fn apply_ranges_to_line(line: Line<'static>, ranges: &[(usize, usize, bool)]) ->
             }
 
             if range_start_in_span < range_end_in_span {
-                let matched: String = chars[range_start_in_span..range_end_in_span].iter().collect();
-                let style = if is_current { span.style.patch(current_style) } else { span.style.patch(highlight_style) };
+                let matched: String = chars[range_start_in_span..range_end_in_span]
+                    .iter()
+                    .collect();
+                let style = if is_current {
+                    span.style.patch(current_style)
+                } else {
+                    span.style.patch(highlight_style)
+                };
                 if !matched.is_empty() {
                     new_spans.push(Span::styled(matched, style));
                 }
@@ -2062,14 +2426,16 @@ fn apply_ranges_to_line(line: Line<'static>, ranges: &[(usize, usize, bool)]) ->
 }
 
 fn byte_to_char_idx(s: &str, byte_idx: usize) -> usize {
-    s.get(..byte_idx)
-        .map_or(0, |prefix| prefix.chars().count())
+    s.get(..byte_idx).map_or(0, |prefix| prefix.chars().count())
 }
 
 fn search_status_line(search: &SearchState) -> String {
     let count = search.hits.len();
     if search.query.is_empty() {
-        format!(" / Search {}: (type to search, Esc to close) ", search.scope)
+        format!(
+            " / Search {}: (type to search, Esc to close) ",
+            search.scope
+        )
     } else if count == 0 {
         format!(" / Search {}: {} (0 matches) ", search.scope, search.query)
     } else if search.committed {
@@ -2095,7 +2461,12 @@ fn search_status_line(search: &SearchState) -> String {
 fn truncate_str(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() > max_chars {
-        format!("{}…", s.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
     } else {
         s
     }
@@ -2205,7 +2576,10 @@ fn compute_style(bold: bool, italic: bool, code: bool, heading: bool) -> Style {
 
 fn render_prompt_tab(turn: &Turn) -> Text<'static> {
     let mut lines = vec![
-        Line::styled("User Prompt:".to_string(), Style::default().fg(Color::Cyan).bold()),
+        Line::styled(
+            "User Prompt:".to_string(),
+            Style::default().fg(Color::Cyan).bold(),
+        ),
         Line::from(""),
     ];
 
@@ -2216,9 +2590,15 @@ fn render_prompt_tab(turn: &Turn) -> Text<'static> {
 
     if !turn.response.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::styled("─".repeat(40), Style::default().fg(Color::DarkGray)));
+        lines.push(Line::styled(
+            "─".repeat(40),
+            Style::default().fg(Color::DarkGray),
+        ));
         lines.push(Line::from(""));
-        lines.push(Line::styled("Response:".to_string(), Style::default().fg(Color::Green).bold()));
+        lines.push(Line::styled(
+            "Response:".to_string(),
+            Style::default().fg(Color::Green).bold(),
+        ));
         lines.push(Line::from(""));
         // Render response as markdown
         lines.extend(render_markdown(&turn.response));
@@ -2230,26 +2610,38 @@ fn render_prompt_tab(turn: &Turn) -> Text<'static> {
 fn render_thinking_tab(turn: &Turn) -> Text<'static> {
     if let Some(thinking) = &turn.thinking {
         let mut lines = vec![
-            Line::styled("Model Thinking:".to_string(), Style::default().fg(Color::Magenta).bold()),
+            Line::styled(
+                "Model Thinking:".to_string(),
+                Style::default().fg(Color::Magenta).bold(),
+            ),
             Line::from(""),
         ];
         // Render thinking as markdown
         lines.extend(render_markdown(thinking));
         Text::from(lines)
     } else {
-        Text::styled("No thinking available for this turn".to_string(), Style::default().fg(Color::DarkGray))
+        Text::styled(
+            "No thinking available for this turn".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )
     }
 }
 
 fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
     if turn.tool_invocations.is_empty() {
-        return Text::styled("No tool calls in this turn".to_string(), Style::default().fg(Color::DarkGray));
+        return Text::styled(
+            "No tool calls in this turn".to_string(),
+            Style::default().fg(Color::DarkGray),
+        );
     }
 
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::styled(
-        format!("Tool Calls ({} total) - j/k to navigate, Enter to open subagent", turn.tool_invocations.len()),
+        format!(
+            "Tool Calls ({} total) - j/k to navigate, Enter to open subagent",
+            turn.tool_invocations.len()
+        ),
         Style::default().fg(Color::Cyan).bold(),
     ));
     lines.push(Line::from(""));
@@ -2261,7 +2653,11 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
 
         // Visual indicator for openable tools
         let marker = if is_selected {
-            if is_openable { "▶ " } else { "● " }
+            if is_openable {
+                "▶ "
+            } else {
+                "● "
+            }
         } else {
             "  "
         };
@@ -2278,7 +2674,12 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
 
         // Tool label with context snippet
         let (tool_label, tool_context) = match &tool.tool_type {
-            ToolType::Task { subagent_type, subagent_turns, description, .. } => {
+            ToolType::Task {
+                subagent_type,
+                subagent_turns,
+                description,
+                ..
+            } => {
                 let type_info = subagent_type.as_deref().unwrap_or("Task");
                 let label = if subagent_turns.is_empty() {
                     type_info.to_string()
@@ -2337,7 +2738,10 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
 
         lines.push(Line::from(vec![
             Span::raw(marker),
-            Span::styled(format!("[{}] ", i + 1), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("[{}] ", i + 1),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(tool_label, header_style),
             category_span,
             context_span,
@@ -2361,7 +2765,10 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             }
 
             // Input
-            lines.push(Line::styled("  Input:".to_string(), Style::default().fg(Color::Green)));
+            lines.push(Line::styled(
+                "  Input:".to_string(),
+                Style::default().fg(Color::Green),
+            ));
             for line in tool.input_display.lines() {
                 lines.push(Line::from(format!("    {line}")));
             }
@@ -2369,12 +2776,18 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
             lines.push(Line::from(""));
 
             // Output
-            lines.push(Line::styled("  Output:".to_string(), Style::default().fg(Color::Yellow)));
+            lines.push(Line::styled(
+                "  Output:".to_string(),
+                Style::default().fg(Color::Yellow),
+            ));
             for line in tool.output_display.lines().take(30) {
                 lines.push(Line::from(format!("    {line}")));
             }
             if tool.output_display.lines().count() > 30 {
-                lines.push(Line::styled("    ... (truncated)".to_string(), Style::default().fg(Color::DarkGray)));
+                lines.push(Line::styled(
+                    "    ... (truncated)".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
 
             // Hint for openable tools
@@ -2382,7 +2795,9 @@ fn render_tool_calls_tab(turn: &Turn, scroll_offset: usize) -> Text<'static> {
                 lines.push(Line::from(""));
                 lines.push(Line::styled(
                     "  Press Enter to view subagent conversation".to_string(),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::ITALIC),
                 ));
             }
 
@@ -2422,7 +2837,10 @@ fn render_diff_inner(lines: &mut Vec<Line>, tool: &ToolInvocation, prefix: &str)
             format!("─── {prefix} {path} ───")
         };
 
-        lines.push(Line::styled(header, Style::default().fg(Color::Cyan).bold()));
+        lines.push(Line::styled(
+            header,
+            Style::default().fg(Color::Cyan).bold(),
+        ));
         lines.push(Line::from(""));
 
         for line in diff.lines() {
@@ -2457,7 +2875,12 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
         }
 
         // Collect diffs from subagent turns
-        if let ToolType::Task { subagent_turns, subagent_type, .. } = &tool.tool_type {
+        if let ToolType::Task {
+            subagent_turns,
+            subagent_type,
+            ..
+        } = &tool.tool_type
+        {
             if !subagent_turns.is_empty() {
                 let prefix = format!("[{}]", subagent_type.as_deref().unwrap_or("subagent"));
                 for subturn in subagent_turns {
@@ -2472,7 +2895,10 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
     }
 
     if !has_diff {
-        return Text::styled("No diffs available for this turn".to_string(), Style::default().fg(Color::DarkGray));
+        return Text::styled(
+            "No diffs available for this turn".to_string(),
+            Style::default().fg(Color::DarkGray),
+        );
     }
 
     Text::from(lines)
@@ -2533,12 +2959,14 @@ mod tests {
         let sessions = list_all_sessions();
 
         // Find sessions by slug
-        let unified_exploring_gray: Vec<_> = sessions.iter()
+        let unified_exploring_gray: Vec<_> = sessions
+            .iter()
             .filter(|s| s.slug.as_deref() == Some("unified-exploring-gray"))
             .collect();
 
         // Should be grouped into at most one entry per project
-        let mut per_project: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+        let mut per_project: std::collections::HashMap<PathBuf, usize> =
+            std::collections::HashMap::new();
         for session in &unified_exploring_gray {
             *per_project.entry(session.project_path.clone()).or_insert(0) += 1;
         }
@@ -2619,7 +3047,8 @@ mod tests {
                     session.name
                 );
                 assert_eq!(
-                    session.paths.len(), 1,
+                    session.paths.len(),
+                    1,
                     "Session without slug should have single path: {}",
                     session.name
                 );
@@ -2659,12 +3088,22 @@ mod tests {
         let sessions = list_all_sessions();
 
         // Find a session with single part
-        if let Some(single_session) = sessions.iter().find(|s| s.part_count == 1 && s.source == Source::Claude) {
+        if let Some(single_session) = sessions
+            .iter()
+            .find(|s| s.part_count == 1 && s.source == Source::Claude)
+        {
             let result = single_session.parse();
-            assert!(result.is_ok(), "Should parse single-file session: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Should parse single-file session: {:?}",
+                result.err()
+            );
 
             let session = result.unwrap();
-            assert!(!session.turns.is_empty(), "Parsed session should have turns");
+            assert!(
+                !session.turns.is_empty(),
+                "Parsed session should have turns"
+            );
         }
     }
 
@@ -2675,10 +3114,17 @@ mod tests {
         // Find a grouped session (multiple parts)
         if let Some(grouped_session) = sessions.iter().find(|s| s.part_count > 1) {
             let result = grouped_session.parse();
-            assert!(result.is_ok(), "Should parse grouped session: {:?}", result.err());
+            assert!(
+                result.is_ok(),
+                "Should parse grouped session: {:?}",
+                result.err()
+            );
 
             let session = result.unwrap();
-            assert!(!session.turns.is_empty(), "Parsed grouped session should have turns");
+            assert!(
+                !session.turns.is_empty(),
+                "Parsed grouped session should have turns"
+            );
 
             // The combined session should have more turns than individual files
             // (This is a sanity check - actual count depends on the specific sessions)
@@ -2766,7 +3212,8 @@ mod tests {
                         assert!(
                             filename_stem.contains(&resume_id),
                             "Codex filename should contain the resume UUID: {} not in {}",
-                            resume_id, filename_stem
+                            resume_id,
+                            filename_stem
                         );
                         assert!(
                             !resume_id.contains("rollout"),
@@ -2786,7 +3233,9 @@ mod tests {
         for session in &sessions {
             if session.part_count > 1 {
                 let resume_id = session.resume_session_id();
-                let expected_id = session.paths.last()
+                let expected_id = session
+                    .paths
+                    .last()
                     .and_then(|p| p.file_stem())
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_default();
@@ -2884,7 +3333,8 @@ mod tests {
                 // UUID format: 8-4-4-4-12 hex characters
                 let uuid_parts: Vec<&str> = resume_id.split('-').collect();
                 assert_eq!(
-                    uuid_parts.len(), 5,
+                    uuid_parts.len(),
+                    5,
                     "Codex resume ID should have 5 UUID parts: {}",
                     resume_id
                 );
@@ -2919,7 +3369,9 @@ mod tests {
     fn test_tool_kind_classification_planning_and_subagent() {
         let planning_tool = ToolInvocation {
             id: "plan-1".to_string(),
-            tool_type: ToolType::Other { name: "Plan".to_string() },
+            tool_type: ToolType::Other {
+                name: "Plan".to_string(),
+            },
             input_display: "1. inspect\n2. implement".to_string(),
             output_display: "Plan updated".to_string(),
             raw_input: serde_json::Value::Null,

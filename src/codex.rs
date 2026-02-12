@@ -57,15 +57,16 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
         if path.is_dir() {
             collect_sessions_recursive(&path, sessions);
         } else if path.is_file() {
-            let name = path.file_name()
+            let name = path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
 
             // Only include .json and .jsonl files that have actual content
-            let is_json = std::path::Path::new(&name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl"));
+            let is_json = std::path::Path::new(&name).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl")
+            });
             if is_json {
                 // Skip empty sessions (no actual user messages)
                 if !codex_session_has_messages(&path) {
@@ -220,14 +221,13 @@ pub fn list_codex_sessions_for_project(project_path: &Path) -> Vec<CodexSessionI
 
 /// Parse a Codex session file (supports both JSON and JSONL formats).
 pub fn parse_codex_session(path: &Path) -> Result<Session, String> {
-    let name = path.file_stem()
+    let name = path
+        .file_stem()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
 
-    let extension = path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match extension {
         "jsonl" => parse_jsonl_session(path, &name),
@@ -295,19 +295,20 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
 
 /// Parse old JSON format session.
 fn parse_json_session(path: &Path, name: &str) -> Result<Session, String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read file: {e}"))?;
+    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {e}"))?;
 
-    let data: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse JSON: {e}"))?;
+    let data: Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse JSON: {e}"))?;
 
-    let session_id = data.get("session")
+    let session_id = data
+        .get("session")
         .and_then(|s| s.get("id"))
         .and_then(|i| i.as_str())
         .unwrap_or(name)
         .to_string();
 
-    let items = data.get("items")
+    let items = data
+        .get("items")
         .and_then(|i| i.as_array())
         .cloned()
         .unwrap_or_default();
@@ -333,7 +334,10 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
 
     for entry in entries {
         let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let timestamp = entry.get("timestamp").and_then(|t| t.as_str()).map(String::from);
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .map(String::from);
 
         match entry_type {
             "event_msg" => {
@@ -349,7 +353,8 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                                 }
                             }
 
-                            let message = payload.get("message")
+                            let message = payload
+                                .get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("")
                                 .to_string();
@@ -366,9 +371,8 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                         }
                         "agent_reasoning" => {
                             if let Some(turn) = current_turn.as_mut() {
-                                let text = payload.get("text")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("");
+                                let text =
+                                    payload.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                 if !text.is_empty() {
                                     let existing = turn.thinking.take().unwrap_or_default();
                                     turn.thinking = Some(if existing.is_empty() {
@@ -381,7 +385,8 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                         }
                         "agent_message" => {
                             if let Some(turn) = current_turn.as_mut() {
-                                let message = payload.get("message")
+                                let message = payload
+                                    .get("message")
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("");
                                 if !message.is_empty() {
@@ -404,14 +409,16 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
 
                     match item_type {
                         "function_call" | "custom_tool_call" => {
-                            let call_id = payload.get("call_id")
+                            let call_id = payload
+                                .get("call_id")
                                 .and_then(|c| c.as_str())
                                 .unwrap_or("")
                                 .to_string();
                             pending_calls.insert(call_id, payload.clone());
                         }
                         "function_call_output" | "custom_tool_call_output" => {
-                            let call_id = payload.get("call_id")
+                            let call_id = payload
+                                .get("call_id")
                                 .and_then(|c| c.as_str())
                                 .unwrap_or("");
 
@@ -424,12 +431,15 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                         }
                         "reasoning" => {
                             if let Some(turn) = current_turn.as_mut() {
-                                let content = payload.get("content")
+                                let content = payload
+                                    .get("content")
                                     .and_then(|c| c.as_array())
                                     .and_then(|arr| {
                                         arr.iter()
                                             .filter_map(|item| {
-                                                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                                if item.get("type").and_then(|t| t.as_str())
+                                                    == Some("text")
+                                                {
                                                     item.get("text").and_then(|t| t.as_str())
                                                 } else {
                                                     None
@@ -516,7 +526,8 @@ fn build_turns_from_json(items: &[Value]) -> Vec<Turn> {
             "reasoning" => {
                 if let Some(turn) = current_turn.as_mut() {
                     // Reasoning in old format might have summary array
-                    let summary = item.get("summary")
+                    let summary = item
+                        .get("summary")
                         .and_then(|s| s.as_array())
                         .map(|arr| {
                             arr.iter()
@@ -537,7 +548,8 @@ fn build_turns_from_json(items: &[Value]) -> Vec<Turn> {
                 }
             }
             "function_call" => {
-                let call_id = item.get("call_id")
+                let call_id = item
+                    .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(|c| c.as_str())
                     .unwrap_or("")
@@ -545,9 +557,7 @@ fn build_turns_from_json(items: &[Value]) -> Vec<Turn> {
                 pending_calls.insert(call_id, item.clone());
             }
             "function_call_output" => {
-                let call_id = item.get("call_id")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
+                let call_id = item.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
 
                 if let Some(call) = pending_calls.remove(call_id) {
                     if let Some(turn) = current_turn.as_mut() {
@@ -577,7 +587,8 @@ fn extract_message_content(item: &Value) -> String {
             return s.to_string();
         }
         if let Some(arr) = content.as_array() {
-            return arr.iter()
+            return arr
+                .iter()
                 .filter_map(|c| {
                     let c_type = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if c_type == "input_text" || c_type == "text" {
@@ -595,13 +606,15 @@ fn extract_message_content(item: &Value) -> String {
 
 /// Create a tool invocation from call and output.
 fn create_tool_invocation(call: &Value, output: &Value) -> ToolInvocation {
-    let call_id = call.get("call_id")
+    let call_id = call
+        .get("call_id")
         .or_else(|| call.get("id"))
         .and_then(|c| c.as_str())
         .unwrap_or("unknown")
         .to_string();
 
-    let name = call.get("name")
+    let name = call
+        .get("name")
         .and_then(|n| n.as_str())
         .unwrap_or("unknown");
 
@@ -622,26 +635,31 @@ fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, Stri
     match name {
         "shell_command" => {
             let args = parse_arguments(call);
-            let command = args.get("command")
+            let command = args
+                .get("command")
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            let workdir = args.get("workdir")
+            let workdir = args
+                .get("workdir")
                 .and_then(|w| w.as_str())
                 .map(String::from);
 
-            let output_text = output.get("output")
+            let output_text = output
+                .get("output")
                 .and_then(|o| o.as_str())
                 .unwrap_or("")
                 .to_string();
 
             // Parse exit code from output
-            let exit_code = output_text.lines()
+            let exit_code = output_text
+                .lines()
                 .find(|l| l.starts_with("Exit code:"))
                 .and_then(|l| l.trim_start_matches("Exit code:").trim().parse().ok());
 
             // Extract actual output after headers
-            let stdout = output_text.lines()
+            let stdout = output_text
+                .lines()
                 .skip_while(|l| !l.starts_with("Output:"))
                 .skip(1)
                 .collect::<Vec<_>>()
@@ -665,20 +683,22 @@ fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, Stri
             )
         }
         "apply_patch" => {
-            let input = call.get("input")
-                .and_then(|i| i.as_str())
-                .unwrap_or("");
+            let input = call.get("input").and_then(|i| i.as_str()).unwrap_or("");
 
             // Extract file path from patch
-            let path = input.lines()
+            let path = input
+                .lines()
                 .find(|l| l.starts_with("*** Update File:") || l.starts_with("*** Add File:"))
-                .map(|l| l.trim_start_matches("*** Update File:")
-                    .trim_start_matches("*** Add File:")
-                    .trim()
-                    .to_string())
+                .map(|l| {
+                    l.trim_start_matches("*** Update File:")
+                        .trim_start_matches("*** Add File:")
+                        .trim()
+                        .to_string()
+                })
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let status = call.get("status")
+            let status = call
+                .get("status")
                 .and_then(|s| s.as_str())
                 .unwrap_or("unknown");
 
@@ -695,13 +715,16 @@ fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, Stri
         }
         "update_plan" => {
             let args = parse_arguments(call);
-            let plan = args.get("plan")
+            let plan = args
+                .get("plan")
                 .and_then(|p| p.as_str())
                 .or_else(|| args.get("text").and_then(|t| t.as_str()))
                 .unwrap_or("");
 
             (
-                ToolType::Other { name: "Plan".to_string() },
+                ToolType::Other {
+                    name: "Plan".to_string(),
+                },
                 truncate_display(plan, 200),
                 "Plan updated".to_string(),
             )
@@ -709,12 +732,12 @@ fn parse_codex_tool(name: &str, call: &Value, output: &Value) -> (ToolType, Stri
         _ => {
             let args = parse_arguments(call);
             let input_str = serde_json::to_string_pretty(&args).unwrap_or_default();
-            let output_str = output.get("output")
-                .and_then(|o| o.as_str())
-                .unwrap_or("");
+            let output_str = output.get("output").and_then(|o| o.as_str()).unwrap_or("");
 
             (
-                ToolType::Other { name: name.to_string() },
+                ToolType::Other {
+                    name: name.to_string(),
+                },
                 truncate_display(&input_str, 200),
                 truncate_display(output_str, 500),
             )
@@ -744,7 +767,12 @@ fn parse_arguments(call: &Value) -> Value {
 fn truncate_display(s: &str, max_chars: usize) -> String {
     let s = s.replace('\n', " ").replace('\r', "");
     if s.chars().count() > max_chars {
-        format!("{}...", s.chars().take(max_chars.saturating_sub(3)).collect::<String>())
+        format!(
+            "{}...",
+            s.chars()
+                .take(max_chars.saturating_sub(3))
+                .collect::<String>()
+        )
     } else {
         s
     }
@@ -879,7 +907,9 @@ mod tests {
 
         let tool = &turns[0].tool_invocations[0];
         assert_eq!(tool.id, "call_123");
-        assert!(matches!(&tool.tool_type, ToolType::Command { command, .. } if command == "ls -la"));
+        assert!(
+            matches!(&tool.tool_type, ToolType::Command { command, .. } if command == "ls -la")
+        );
     }
 
     #[test]
@@ -917,8 +947,10 @@ mod tests {
         assert_eq!(turns[0].tool_invocations.len(), 1);
 
         let tool = &turns[0].tool_invocations[0];
-        assert!(matches!(&tool.tool_type, ToolType::FileEdit { path, diff, .. }
-            if path == "src/main.rs" && diff.is_some()));
+        assert!(
+            matches!(&tool.tool_type, ToolType::FileEdit { path, diff, .. }
+            if path == "src/main.rs" && diff.is_some())
+        );
     }
 
     #[test]
@@ -1014,9 +1046,16 @@ mod tests {
             "output": "Exit code: 0\nWall time: 2.5s\nOutput:\n   Compiling project v0.1.0\n    Finished dev"
         });
 
-        let (tool_type, input_display, _output_display) = parse_codex_tool("shell_command", &call, &output);
+        let (tool_type, input_display, _output_display) =
+            parse_codex_tool("shell_command", &call, &output);
 
-        if let ToolType::Command { command, stdout, exit_code, .. } = tool_type {
+        if let ToolType::Command {
+            command,
+            stdout,
+            exit_code,
+            ..
+        } = tool_type
+        {
             assert_eq!(command, "cargo build");
             assert_eq!(exit_code, Some(0));
             assert!(stdout.unwrap().contains("Compiling"));
@@ -1070,7 +1109,10 @@ mod tests {
     fn test_truncate_display() {
         assert_eq!(truncate_display("short", 10), "short");
         assert_eq!(truncate_display("this is a long string", 10), "this is...");
-        assert_eq!(truncate_display("line1\nline2\nline3", 20), "line1 line2 line3");
+        assert_eq!(
+            truncate_display("line1\nline2\nline3", 20),
+            "line1 line2 line3"
+        );
     }
 
     #[test]
@@ -1117,26 +1159,28 @@ mod tests {
                 assert!(!session.turns.is_empty());
 
                 // Check that we have tool invocations
-                let total_tools: usize = session.turns.iter()
-                    .map(|t| t.tool_invocations.len())
-                    .sum();
+                let total_tools: usize =
+                    session.turns.iter().map(|t| t.tool_invocations.len()).sum();
                 assert!(total_tools > 0, "Expected tool invocations");
 
                 // Check that we have thinking
-                let has_thinking = session.turns.iter()
-                    .any(|t| t.thinking.is_some());
+                let has_thinking = session.turns.iter().any(|t| t.thinking.is_some());
                 assert!(has_thinking, "Expected thinking/reasoning");
 
-                println!("Parsed JSONL session: {} turns, {} tools",
-                    session.turns.len(), total_tools);
+                println!(
+                    "Parsed JSONL session: {} turns, {} tools",
+                    session.turns.len(),
+                    total_tools
+                );
             }
         }
     }
 
     #[test]
     fn test_parse_real_codex_json_session() {
-        let session_path = dirs::home_dir()
-            .map(|h| h.join(".codex/sessions/rollout-2025-04-17-0d977bc7-bc20-48e2-9b88-f3588e1ded60.json"));
+        let session_path = dirs::home_dir().map(|h| {
+            h.join(".codex/sessions/rollout-2025-04-17-0d977bc7-bc20-48e2-9b88-f3588e1ded60.json")
+        });
 
         if let Some(path) = session_path {
             if path.exists() {

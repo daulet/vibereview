@@ -5,3 +5,6 @@
 - [ ] Fork discussion, capture unstaged changes for it to work properly, eg with hooks
 
 # Bugs
+
+- [ ] Create test session and ensure ALL model responses, sub calls, planning is visible in session
+ 

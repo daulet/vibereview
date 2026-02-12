@@ -2,8 +2,8 @@
 //! Designed to support multiple sources (Claude Code, other LLM tools, etc.)
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use similar::TextDiff;
+use std::path::PathBuf;
 
 /// A session contains metadata and a list of conversation turns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +121,12 @@ impl ToolType {
     /// Returns a diff string if this tool type has one.
     pub fn diff(&self) -> Option<String> {
         match self {
-            Self::FileEdit { diff, old_content, new_content, .. } => {
+            Self::FileEdit {
+                diff,
+                old_content,
+                new_content,
+                ..
+            } => {
                 if let Some(d) = diff {
                     return Some(d.clone());
                 }
@@ -134,10 +139,7 @@ impl ToolType {
             }
             Self::FileWrite { content, path } => {
                 // Show as all additions
-                let lines: Vec<String> = content
-                    .lines()
-                    .map(|l| format!("+{l}"))
-                    .collect();
+                let lines: Vec<String> = content.lines().map(|l| format!("+{l}")).collect();
                 Some(format!("--- /dev/null\n+++ {}\n{}", path, lines.join("\n")))
             }
             _ => None,

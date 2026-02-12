@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::models::{Session, SessionSource, Turn, ToolInvocation, ToolType, TodoItem};
+use crate::models::{Session, SessionSource, TodoItem, ToolInvocation, ToolType, Turn};
 
 /// Get the Claude projects directory.
 pub fn get_claude_projects_dir() -> Option<PathBuf> {
@@ -61,7 +61,11 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "jsonl") {
-            let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let name = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             // Skip agent files - they'll be embedded in parent sessions
             if name.starts_with("agent-") {
                 continue;
@@ -71,9 +75,7 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
                 continue;
             }
             // Get file metadata for sorting by modification time
-            let modified = fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok();
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
             // Extract description and slug
             let (description, slug) = extract_session_metadata(&path);
             sessions.push(SessionInfo {
@@ -135,7 +137,9 @@ fn extract_session_metadata(path: &Path) -> (Option<String>, Option<String>) {
                     .and_then(|c| c.as_str())
                 {
                     // Skip command messages
-                    if !content.starts_with("<command-name>") && !content.starts_with("<local-command") {
+                    if !content.starts_with("<command-name>")
+                        && !content.starts_with("<local-command")
+                    {
                         first_user_content = Some(content.to_string());
                     }
                 }
@@ -181,7 +185,11 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open file: {e}"))?;
     let reader = BufReader::new(file);
 
-    let session_id = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let session_id = path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let project_dir = path.parent();
     let session_dir = project_dir.map(|p| p.join(&session_id));
     let tool_results_dir = session_dir.as_ref().map(|p| p.join("tool-results"));
@@ -198,7 +206,11 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     }
 
     // Build turns by pairing user messages with assistant responses
-    let turns = build_turns(&entries, tool_results_dir.as_deref(), session_dir.as_deref());
+    let turns = build_turns(
+        &entries,
+        tool_results_dir.as_deref(),
+        session_dir.as_deref(),
+    );
 
     // Extract session metadata
     let version = entries
@@ -222,7 +234,11 @@ pub fn parse_session(path: &Path) -> Result<Session, String> {
     })
 }
 
-fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: Option<&Path>) -> Vec<Turn> {
+fn build_turns(
+    entries: &[Value],
+    tool_results_dir: Option<&Path>,
+    session_dir: Option<&Path>,
+) -> Vec<Turn> {
     let mut turns = Vec::new();
     let mut i = 0;
 
@@ -238,8 +254,15 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: 
 
         // Found a user message, look for the next assistant response
         let user_prompt = extract_user_prompt(entry);
-        let timestamp = entry.get("timestamp").and_then(|t| t.as_str()).map(String::from);
-        let turn_id = entry.get("uuid").and_then(|u| u.as_str()).unwrap_or("").to_string();
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .map(String::from);
+        let turn_id = entry
+            .get("uuid")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // Collect assistant responses and tool results
         let mut thinking = None;
@@ -253,7 +276,10 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: 
         // Process following entries until next user message
         while i < entries.len() {
             let next_entry = &entries[i];
-            let next_type = next_entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let next_type = next_entry
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
 
             if next_type == "user" {
                 // Check if this user message contains tool results
@@ -284,7 +310,11 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: 
                 }
 
                 // Process assistant message content
-                if let Some(content) = next_entry.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+                if let Some(content) = next_entry
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
                     for item in content {
                         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match item_type {
@@ -313,7 +343,13 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: 
                     // Find the corresponding tool use in pending
                     if let Some(tool_id) = find_tool_id_for_result(next_entry) {
                         if let Some(tool_use) = pending_tool_uses.remove(&tool_id) {
-                            let invocation = create_tool_invocation(&tool_id, &tool_use, Some(tool_result), tool_results_dir, session_dir);
+                            let invocation = create_tool_invocation(
+                                &tool_id,
+                                &tool_use,
+                                Some(tool_result),
+                                tool_results_dir,
+                                session_dir,
+                            );
                             tool_invocations.push(invocation);
                         }
                     }
@@ -325,7 +361,8 @@ fn build_turns(entries: &[Value], tool_results_dir: Option<&Path>, session_dir: 
 
         // Add any remaining tool uses without results
         for (tool_id, tool_use) in pending_tool_uses {
-            let invocation = create_tool_invocation(&tool_id, &tool_use, None, tool_results_dir, session_dir);
+            let invocation =
+                create_tool_invocation(&tool_id, &tool_use, None, tool_results_dir, session_dir);
             tool_invocations.push(invocation);
         }
 
@@ -394,11 +431,20 @@ fn process_tool_results(
                 continue;
             }
 
-            let tool_id = item.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("");
+            let tool_id = item
+                .get("tool_use_id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("");
             if let Some(tool_use) = pending_tool_uses.remove(tool_id) {
                 // Prefer entry's toolUseResult (has agentId), fall back to item content
                 let result = entry_tool_use_result.or_else(|| item.get("content"));
-                let invocation = create_tool_invocation(tool_id, &tool_use, result, tool_results_dir, session_dir);
+                let invocation = create_tool_invocation(
+                    tool_id,
+                    &tool_use,
+                    result,
+                    tool_results_dir,
+                    session_dir,
+                );
                 tool_invocations.push(invocation);
             }
         }
@@ -407,7 +453,8 @@ fn process_tool_results(
 
 fn find_tool_id_for_result(entry: &Value) -> Option<String> {
     // Try to find tool ID from the entry context
-    entry.get("message")
+    entry
+        .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
         .and_then(|arr| {
@@ -424,10 +471,20 @@ fn create_tool_invocation(
     tool_results_dir: Option<&Path>,
     session_dir: Option<&Path>,
 ) -> ToolInvocation {
-    let tool_name = tool_use.get("name").and_then(|n| n.as_str()).unwrap_or("Unknown");
+    let tool_name = tool_use
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("Unknown");
     let input = tool_use.get("input").cloned().unwrap_or(Value::Null);
 
-    let (tool_type, input_display, output_display) = parse_tool_type(tool_name, &input, result, tool_id, tool_results_dir, session_dir);
+    let (tool_type, input_display, output_display) = parse_tool_type(
+        tool_name,
+        &input,
+        result,
+        tool_id,
+        tool_results_dir,
+        session_dir,
+    );
 
     ToolInvocation {
         id: tool_id.to_string(),
@@ -449,10 +506,16 @@ fn parse_tool_type(
 ) -> (ToolType, String, String) {
     match tool_name {
         "Read" => {
-            let path = input.get("file_path").and_then(|p| p.as_str()).unwrap_or("").to_string();
+            let path = input
+                .get("file_path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
             let content = extract_result_string(result, tool_id, tool_results_dir);
             let input_display = path.clone();
-            let output_display = content.clone().unwrap_or_else(|| "(no content)".to_string());
+            let output_display = content
+                .clone()
+                .unwrap_or_else(|| "(no content)".to_string());
             (
                 ToolType::FileRead { path, content },
                 input_display,
@@ -460,8 +523,16 @@ fn parse_tool_type(
             )
         }
         "Write" => {
-            let path = input.get("file_path").and_then(|p| p.as_str()).unwrap_or("").to_string();
-            let content = input.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let path = input
+                .get("file_path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            let content = input
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             let input_display = format!("{}\n\n{}", path, truncate_display(&content, 200));
             let output_display = extract_result_string(result, tool_id, tool_results_dir)
                 .unwrap_or_else(|| "File written".to_string());
@@ -472,32 +543,53 @@ fn parse_tool_type(
             )
         }
         "Edit" => {
-            let path = input.get("file_path").and_then(|p| p.as_str()).unwrap_or("").to_string();
-            let old_string = input.get("old_string").and_then(|s| s.as_str()).map(String::from);
-            let new_string = input.get("new_string").and_then(|s| s.as_str()).map(String::from);
+            let path = input
+                .get("file_path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            let old_string = input
+                .get("old_string")
+                .and_then(|s| s.as_str())
+                .map(String::from);
+            let new_string = input
+                .get("new_string")
+                .and_then(|s| s.as_str())
+                .map(String::from);
 
             // Try to get diff from result
-            let diff = result.and_then(|r| {
-                r.get("structuredPatch").map(|_| {
-                    // Build diff from old/new strings
-                    if let (Some(old), Some(new)) = (&old_string, &new_string) {
-                        format!("--- a/{}\n+++ b/{}\n{}", path, path,
-                            generate_unified_diff(old, new))
-                    } else {
-                        String::new()
-                    }
+            let diff = result
+                .and_then(|r| {
+                    r.get("structuredPatch").map(|_| {
+                        // Build diff from old/new strings
+                        if let (Some(old), Some(new)) = (&old_string, &new_string) {
+                            format!(
+                                "--- a/{}\n+++ b/{}\n{}",
+                                path,
+                                path,
+                                generate_unified_diff(old, new)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    })
                 })
-            }).or_else(|| {
-                // Generate diff from old/new if available
-                if let (Some(old), Some(new)) = (&old_string, &new_string) {
-                    Some(format!("--- a/{}\n+++ b/{}\n{}", path, path,
-                        generate_unified_diff(old, new)))
-                } else {
-                    None
-                }
-            });
+                .or_else(|| {
+                    // Generate diff from old/new if available
+                    if let (Some(old), Some(new)) = (&old_string, &new_string) {
+                        Some(format!(
+                            "--- a/{}\n+++ b/{}\n{}",
+                            path,
+                            path,
+                            generate_unified_diff(old, new)
+                        ))
+                    } else {
+                        None
+                    }
+                });
 
-            let input_display = format!("{}:\n  -{}\n  +{}",
+            let input_display = format!(
+                "{}:\n  -{}\n  +{}",
                 path,
                 truncate_display(old_string.as_deref().unwrap_or(""), 100),
                 truncate_display(new_string.as_deref().unwrap_or(""), 100),
@@ -516,12 +608,18 @@ fn parse_tool_type(
             )
         }
         "Bash" => {
-            let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let command = input
+                .get("command")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             let description = input.get("description").and_then(|d| d.as_str());
 
             let (stdout, stderr) = if let Some(r) = result {
                 (
-                    r.get("stdout").and_then(|s| s.as_str()).map(String::from)
+                    r.get("stdout")
+                        .and_then(|s| s.as_str())
+                        .map(String::from)
                         .or_else(|| extract_result_string(Some(r), tool_id, tool_results_dir)),
                     r.get("stderr").and_then(|s| s.as_str()).map(String::from),
                 )
@@ -548,57 +646,93 @@ fn parse_tool_type(
             )
         }
         "Glob" => {
-            let pattern = input.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string();
+            let pattern = input
+                .get("pattern")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
             let results: Vec<String> = extract_result_string(result, tool_id, tool_results_dir)
                 .map(|s| s.lines().map(String::from).collect())
                 .unwrap_or_default();
             let output_display = results.join("\n");
             (
-                ToolType::Search { pattern: pattern.clone(), results },
+                ToolType::Search {
+                    pattern: pattern.clone(),
+                    results,
+                },
                 pattern,
                 truncate_display(&output_display, 500),
             )
         }
         "Grep" => {
-            let pattern = input.get("pattern").and_then(|p| p.as_str()).unwrap_or("").to_string();
+            let pattern = input
+                .get("pattern")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
             let results: Vec<String> = extract_result_string(result, tool_id, tool_results_dir)
                 .map(|s| s.lines().map(String::from).collect())
                 .unwrap_or_default();
             let output_display = results.join("\n");
             (
-                ToolType::Search { pattern: pattern.clone(), results },
+                ToolType::Search {
+                    pattern: pattern.clone(),
+                    results,
+                },
                 pattern,
                 truncate_display(&output_display, 500),
             )
         }
         "WebFetch" => {
-            let url = input.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+            let url = input
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
             let content = extract_result_string(result, tool_id, tool_results_dir);
-            let output_display = content.clone().unwrap_or_else(|| "(no content)".to_string());
+            let output_display = content
+                .clone()
+                .unwrap_or_else(|| "(no content)".to_string());
             (
-                ToolType::WebFetch { url: url.clone(), content },
+                ToolType::WebFetch {
+                    url: url.clone(),
+                    content,
+                },
                 url,
                 truncate_display(&output_display, 500),
             )
         }
         "WebSearch" => {
-            let query = input.get("query").and_then(|q| q.as_str()).unwrap_or("").to_string();
+            let query = input
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .to_string();
             let results = extract_result_string(result, tool_id, tool_results_dir);
-            let output_display = results.clone().unwrap_or_else(|| "(no results)".to_string());
+            let output_display = results
+                .clone()
+                .unwrap_or_else(|| "(no results)".to_string());
             (
-                ToolType::WebSearch { query: query.clone(), results },
+                ToolType::WebSearch {
+                    query: query.clone(),
+                    results,
+                },
                 query,
                 truncate_display(&output_display, 500),
             )
         }
         "TodoWrite" => {
-            let todos: Vec<TodoItem> = input.get("todos")
+            let todos: Vec<TodoItem> = input
+                .get("todos")
                 .and_then(|t| t.as_array())
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|item| {
                             let content = item.get("content").and_then(|c| c.as_str())?;
-                            let status = item.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+                            let status = item
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("pending");
                             Some(TodoItem {
                                 content: content.to_string(),
                                 status: status.to_string(),
@@ -608,7 +742,8 @@ fn parse_tool_type(
                 })
                 .unwrap_or_default();
 
-            let input_display = todos.iter()
+            let input_display = todos
+                .iter()
                 .map(|t| {
                     let checkbox = match t.status.as_str() {
                         "completed" => "- [x]",
@@ -627,9 +762,20 @@ fn parse_tool_type(
             )
         }
         "Task" => {
-            let description = input.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-            let prompt = input.get("prompt").and_then(|p| p.as_str()).unwrap_or("").to_string();
-            let subagent_type = input.get("subagent_type").and_then(|s| s.as_str()).map(String::from);
+            let description = input
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let prompt = input
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            let subagent_type = input
+                .get("subagent_type")
+                .and_then(|s| s.as_str())
+                .map(String::from);
             let result_str = extract_result_string(result, tool_id, tool_results_dir);
 
             // Try to extract agentId from result JSON (toolUseResult.agentId) or from text
@@ -671,7 +817,9 @@ fn parse_tool_type(
                 .map(|r| serde_json::to_string_pretty(r).unwrap_or_default())
                 .unwrap_or_default();
             (
-                ToolType::Other { name: tool_name.to_string() },
+                ToolType::Other {
+                    name: tool_name.to_string(),
+                },
                 truncate_display(&input_display, 300),
                 truncate_display(&output_display, 500),
             )
@@ -679,7 +827,11 @@ fn parse_tool_type(
     }
 }
 
-fn extract_result_string(result: Option<&Value>, tool_id: &str, tool_results_dir: Option<&Path>) -> Option<String> {
+fn extract_result_string(
+    result: Option<&Value>,
+    tool_id: &str,
+    tool_results_dir: Option<&Path>,
+) -> Option<String> {
     // First try to get from result directly
     if let Some(r) = result {
         // Try different content locations
@@ -789,7 +941,8 @@ fn extract_agent_id(result: &str) -> Option<String> {
                 let after = &line[pos + 7..];
                 let after = after.trim_start_matches(':').trim();
                 // Extract just the ID part (before any parenthesis or space)
-                let id = after.split(|c: char| c.is_whitespace() || c == '(')
+                let id = after
+                    .split(|c: char| c.is_whitespace() || c == '(')
                     .next()
                     .map(str::trim);
                 if let Some(id) = id {
@@ -871,7 +1024,7 @@ mod tests {
     fn test_truncate_display_multibyte_utf8() {
         // Japanese text - each character is 3 bytes
         let text = "こんにちは世界"; // "Hello World" in Japanese
-        // Should not panic and should truncate by characters, not bytes
+                                     // Should not panic and should truncate by characters, not bytes
         let truncated = truncate_display(text, 3);
         assert_eq!(truncated, "こんに...");
 
@@ -894,7 +1047,10 @@ mod tests {
 
     #[test]
     fn test_extract_agent_id_simple() {
-        assert_eq!(extract_agent_id("agentId: abc123"), Some("abc123".to_string()));
+        assert_eq!(
+            extract_agent_id("agentId: abc123"),
+            Some("abc123".to_string())
+        );
     }
 
     #[test]
@@ -906,7 +1062,8 @@ mod tests {
 
     #[test]
     fn test_extract_agent_id_multiline() {
-        let text = "## Exploration Summary\n\nSome content here...\n\nagentId: a3dc895 (for resuming)";
+        let text =
+            "## Exploration Summary\n\nSome content here...\n\nagentId: a3dc895 (for resuming)";
         assert_eq!(extract_agent_id(text), Some("a3dc895".to_string()));
     }
 
@@ -1041,7 +1198,13 @@ mod tests {
         let (tool_type, _input_display, _output_display) =
             parse_tool_type("Edit", &input, None, "tool1", None, None);
 
-        if let ToolType::FileEdit { path, old_content, new_content, diff } = tool_type {
+        if let ToolType::FileEdit {
+            path,
+            old_content,
+            new_content,
+            diff,
+        } = tool_type
+        {
             assert_eq!(path, "/Users/test/Cargo.toml");
             assert!(old_content.is_some());
             assert!(new_content.is_some());
@@ -1068,7 +1231,10 @@ mod tests {
         let (tool_type, input_display, output_display) =
             parse_tool_type("Bash", &input, Some(&result), "tool1", None, None);
 
-        if let ToolType::Command { command, stdout, .. } = tool_type {
+        if let ToolType::Command {
+            command, stdout, ..
+        } = tool_type
+        {
             assert_eq!(command, "cargo build");
             assert!(stdout.unwrap().contains("Compiling"));
         } else {
@@ -1101,7 +1267,14 @@ mod tests {
         let (tool_type, _input_display, _output_display) =
             parse_tool_type("Task", &input, Some(&result), "tool1", None, None);
 
-        if let ToolType::Task { description, prompt, subagent_type, result: result_str, .. } = tool_type {
+        if let ToolType::Task {
+            description,
+            prompt,
+            subagent_type,
+            result: result_str,
+            ..
+        } = tool_type
+        {
             assert_eq!(description, "Explore codebase structure");
             assert_eq!(prompt, "Explore the codebase");
             assert_eq!(subagent_type, Some("Explore".to_string()));
@@ -1129,9 +1302,8 @@ mod tests {
         let subagents_dir = root.join(session_id).join("subagents");
         std::fs::create_dir_all(&subagents_dir).unwrap();
 
-        let mut subagent_file = std::fs::File::create(
-            subagents_dir.join(format!("agent-{agent_id}.jsonl")),
-        ).unwrap();
+        let mut subagent_file =
+            std::fs::File::create(subagents_dir.join(format!("agent-{agent_id}.jsonl"))).unwrap();
         writeln!(
             subagent_file,
             "{}",
@@ -1140,7 +1312,8 @@ mod tests {
                 "uuid": "sub-u",
                 "message": {"role": "user", "content": "Investigate"}
             })
-        ).unwrap();
+        )
+        .unwrap();
         writeln!(
             subagent_file,
             "{}",
@@ -1149,7 +1322,8 @@ mod tests {
                 "uuid": "sub-a",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "Done"}]}
             })
-        ).unwrap();
+        )
+        .unwrap();
         drop(subagent_file);
 
         let mut session_file = std::fs::File::create(&session_path).unwrap();
@@ -1161,7 +1335,8 @@ mod tests {
                 "uuid": "u1",
                 "message": {"role": "user", "content": "Run a task"}
             })
-        ).unwrap();
+        )
+        .unwrap();
         writeln!(
             session_file,
             "{}",
@@ -1182,7 +1357,8 @@ mod tests {
                     }]
                 }
             })
-        ).unwrap();
+        )
+        .unwrap();
         writeln!(
             session_file,
             "{}",
@@ -1202,7 +1378,8 @@ mod tests {
                     "content": [{"type": "text", "text": "agent complete"}]
                 }
             })
-        ).unwrap();
+        )
+        .unwrap();
         drop(session_file);
 
         let session = parse_session(&session_path).expect("session should parse");
@@ -1289,7 +1466,7 @@ mod tests {
                         {"type": "text", "text": "I'd be happy to help with Rust!"}
                     ]
                 }
-            })
+            }),
         ];
 
         let turns = build_turns(&entries, None, None);
@@ -1317,7 +1494,7 @@ mod tests {
                         {"type": "text", "text": "Closures are anonymous functions that capture their environment."}
                     ]
                 }
-            })
+            }),
         ];
 
         let turns = build_turns(&entries, None, None);
@@ -1374,7 +1551,7 @@ mod tests {
                         {"type": "text", "text": "Your project is named 'myproject'."}
                     ]
                 }
-            })
+            }),
         ];
 
         let turns = build_turns(&entries, None, None);
@@ -1383,7 +1560,9 @@ mod tests {
 
         let tool = &turns[0].tool_invocations[0];
         assert_eq!(tool.id, "toolu_123");
-        assert!(matches!(&tool.tool_type, ToolType::FileRead { path, .. } if path == "/project/Cargo.toml"));
+        assert!(
+            matches!(&tool.tool_type, ToolType::FileRead { path, .. } if path == "/project/Cargo.toml")
+        );
     }
 
     #[test]
@@ -1455,7 +1634,10 @@ mod tests {
         if let ToolType::Task { result, .. } = &invocations[0].tool_type {
             assert!(result.is_some());
             // Should contain content from toolUseResult
-            assert!(result.as_ref().unwrap().contains("Result from toolUseResult"));
+            assert!(result
+                .as_ref()
+                .unwrap()
+                .contains("Result from toolUseResult"));
         } else {
             panic!("Expected Task tool type");
         }
@@ -1504,9 +1686,16 @@ mod tests {
                 // Based on the session we explored, we expect:
                 // - 2 Task tools
                 // - Multiple Read, Edit, Bash tools
-                assert!(task_count >= 2, "Expected at least 2 Task tools, got {}", task_count);
-                assert!(task_with_subagent_count >= 1,
-                    "Expected at least 1 Task with subagent turns, got {}", task_with_subagent_count);
+                assert!(
+                    task_count >= 2,
+                    "Expected at least 2 Task tools, got {}",
+                    task_count
+                );
+                assert!(
+                    task_with_subagent_count >= 1,
+                    "Expected at least 1 Task with subagent turns, got {}",
+                    task_with_subagent_count
+                );
                 assert!(read_count > 0, "Expected Read tools");
                 assert!(edit_count > 0, "Expected Edit tools");
             }
@@ -1515,8 +1704,8 @@ mod tests {
 
     #[test]
     fn test_list_sessions_excludes_agent_files() {
-        let project_path = dirs::home_dir()
-            .map(|h| h.join(".claude/projects/-Users-dzhanguzin-dev-promptui"));
+        let project_path =
+            dirs::home_dir().map(|h| h.join(".claude/projects/-Users-dzhanguzin-dev-promptui"));
 
         if let Some(path) = project_path {
             if path.exists() {
@@ -1606,9 +1795,17 @@ mod tests {
 
         // Create a test session file with slug
         let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, r#"{{"type":"file-history-snapshot","messageId":"123"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"file-history-snapshot","messageId":"123"}}"#
+        )
+        .unwrap();
         writeln!(file, r#"{{"type":"user","slug":"test-slug-name","message":{{"role":"user","content":"Hello"}}}}"#).unwrap();
-        writeln!(file, r#"{{"type":"summary","summary":"Test summary description"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"summary","summary":"Test summary description"}}"#
+        )
+        .unwrap();
         drop(file);
 
         let (description, slug) = extract_session_metadata(&path);
@@ -1628,8 +1825,16 @@ mod tests {
 
         // Create a test session file without slug
         let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, r#"{{"type":"file-history-snapshot","messageId":"123"}}"#).unwrap();
-        writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"First user message"}}}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"file-history-snapshot","messageId":"123"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"role":"user","content":"First user message"}}}}"#
+        )
+        .unwrap();
         writeln!(file, r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"Response"}}]}}}}"#).unwrap();
         drop(file);
 
@@ -1650,9 +1855,17 @@ mod tests {
 
         // Create a test session file with compact summary (should be skipped for description)
         let mut file = std::fs::File::create(&path).unwrap();
-        writeln!(file, r#"{{"type":"system","subtype":"compact_boundary","slug":"compacted-session"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"system","subtype":"compact_boundary","slug":"compacted-session"}}"#
+        )
+        .unwrap();
         writeln!(file, r#"{{"type":"user","isCompactSummary":true,"message":{{"role":"user","content":"This is a long summary..."}}}}"#).unwrap();
-        writeln!(file, r#"{{"type":"user","message":{{"role":"user","content":"Real user message"}}}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"role":"user","content":"Real user message"}}}}"#
+        )
+        .unwrap();
         drop(file);
 
         let (description, slug) = extract_session_metadata(&path);
@@ -1675,7 +1888,8 @@ mod tests {
                 let sessions = list_sessions(&path);
 
                 // Find a session that should have a slug
-                let session_with_slug = sessions.iter()
+                let session_with_slug = sessions
+                    .iter()
                     .find(|s| s.name == "063cd168-91d2-41bd-b7ba-5d2dee7fc7ab");
 
                 if let Some(session) = session_with_slug {
@@ -1683,7 +1897,8 @@ mod tests {
                 }
 
                 // Verify continuation session has the same slug
-                let continuation = sessions.iter()
+                let continuation = sessions
+                    .iter()
                     .find(|s| s.name == "bd3dc9cd-e84f-4fa3-866d-c000602cc8e5");
 
                 if let Some(session) = continuation {
