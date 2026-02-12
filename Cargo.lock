@@ -1371,24 +1371,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "promptui"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "chrono",
- "color-eyre",
- "crossterm",
- "dirs",
- "pulldown-cmark",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "similar",
- "zstd",
-]
-
-[[package]]
 name = "pulldown-cmark"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2294,6 +2276,24 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vibereview"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "chrono",
+ "color-eyre",
+ "crossterm",
+ "dirs",
+ "pulldown-cmark",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "similar",
+ "zstd",
+]
 
 [[package]]
 name = "want"
