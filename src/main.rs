@@ -485,8 +485,6 @@ impl TurnContext {
 #[derive(Debug, Clone)]
 pub enum CopySource {
     Tab(String), // Tab name: "Prompt", "Thinking", "Tool Calls", "Diff"
-    Prompt,
-    Response,
     Selection,
 }
 
@@ -494,8 +492,6 @@ impl std::fmt::Display for CopySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Tab(name) => write!(f, "{name}"),
-            Self::Prompt => write!(f, "prompt"),
-            Self::Response => write!(f, "response"),
             Self::Selection => write!(f, "selection"),
         }
     }
@@ -1092,16 +1088,6 @@ impl App {
                 let content = self.get_copyable_content();
                 self.copy_to_clipboard(content, CopySource::Tab(tab_name));
             }
-            KeyCode::Char('p') => {
-                // Copy user prompt only
-                let content = self.get_prompt_text();
-                self.copy_to_clipboard(content, CopySource::Prompt);
-            }
-            KeyCode::Char('r') => {
-                // Copy response only
-                let content = self.get_response_text();
-                self.copy_to_clipboard(content, CopySource::Response);
-            }
             KeyCode::Char('R') => {
                 // Show resume confirmation
                 if let Some(i) = self.current_session_index {
@@ -1398,21 +1384,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Get just the user prompt text
-    fn get_prompt_text(&self) -> Option<String> {
-        self.current_context()
-            .and_then(|ctx| ctx.selected_turn())
-            .map(|turn| turn.user_prompt.clone())
-    }
-
-    /// Get just the response text
-    fn get_response_text(&self) -> Option<String> {
-        self.current_context()
-            .and_then(|ctx| ctx.selected_turn())
-            .filter(|turn| !turn.response.is_empty())
-            .map(|turn| turn.response.clone())
     }
 
     fn get_diff_text(&self) -> Option<String> {
@@ -2034,11 +2005,11 @@ fn viewer_help_text(is_subagent_view: bool, can_resume: bool) -> String {
     let resume = if can_resume { " | R: Resume" } else { "" };
     if is_subagent_view {
         format!(
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy{resume} | Esc: Back | q: Quit "
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy{resume} | Esc: Back | q: Quit "
         )
     } else {
         format!(
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c/p/r: Copy{resume} | Enter: Open | q: Quit "
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy{resume} | Enter: Open | q: Quit "
         )
     }
 }
