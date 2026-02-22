@@ -908,13 +908,12 @@ function generateHomeHtml(): string {
 <body>
   <main class="page">
     <section class="hero">
-      <span class="eyebrow">VibeReview Cloud</span>
-      <h1>Recent Public Sessions</h1>
+      <span class="eyebrow">VibeReview.org</span>
+      <h1>Recent Public Uploads</h1>
       <p>
-        Browse sessions that were shared in public mode. Click any item to open it in the viewer.
-        Encrypted shares stay private and do not appear on this page.
+        Browse sessions that were shared in public mode. Or share privately (encrypted end to end).
       </p>
-      <div class="meta">Source: /api/sessions/public</div>
+      <div class="meta">Install: brew install daulet/tap/vibereview</div>
     </section>
 
     <div class="list-head">
