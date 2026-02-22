@@ -165,7 +165,10 @@ pub fn cloud_share_api_url() -> Option<String> {
 
 fn cloud_endpoint_url(absolute_path: &str) -> Result<String> {
     let base = reqwest::Url::parse(CLOUD_SHARE_API_URL).map_err(|e| {
-        color_eyre::eyre::eyre!("Invalid hardcoded cloud API URL '{}': {e}", CLOUD_SHARE_API_URL)
+        color_eyre::eyre::eyre!(
+            "Invalid hardcoded cloud API URL '{}': {e}",
+            CLOUD_SHARE_API_URL
+        )
     })?;
     let endpoint = base.join(absolute_path).map_err(|e| {
         color_eyre::eyre::eyre!(
@@ -236,6 +239,470 @@ pub fn session_fingerprint(session: &Session) -> Result<String> {
         let _ = write!(&mut output, "{byte:02x}");
     }
     Ok(output)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretScanFinding {
+    pub detector: &'static str,
+    pub location: String,
+    pub sample: String,
+}
+
+impl SecretScanFinding {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!("{} in {} ({})", self.detector, self.location, self.sample)
+    }
+}
+
+/// Scan a parsed session for high-confidence secrets before cloud upload.
+///
+/// The scanner is intentionally conservative and returns only likely credential
+/// matches (token formats, private-key blocks, and obvious bearer values).
+#[must_use]
+pub fn scan_session_for_secrets(session: &Session, max_findings: usize) -> Vec<SecretScanFinding> {
+    let max_findings = max_findings.max(1);
+    let mut findings = Vec::new();
+    let mut seen = HashSet::new();
+
+    scan_text_for_secrets(
+        "session name",
+        &session.name,
+        &mut findings,
+        &mut seen,
+        max_findings,
+    );
+
+    for (turn_idx, turn) in session.turns.iter().enumerate() {
+        let turn_number = turn_idx + 1;
+        scan_text_for_secrets(
+            &format!("turn {turn_number} prompt"),
+            &turn.user_prompt,
+            &mut findings,
+            &mut seen,
+            max_findings,
+        );
+        if findings.len() >= max_findings {
+            return findings;
+        }
+
+        if let Some(thinking) = &turn.thinking {
+            scan_text_for_secrets(
+                &format!("turn {turn_number} thinking"),
+                thinking,
+                &mut findings,
+                &mut seen,
+                max_findings,
+            );
+            if findings.len() >= max_findings {
+                return findings;
+            }
+        }
+
+        scan_text_for_secrets(
+            &format!("turn {turn_number} response"),
+            &turn.response,
+            &mut findings,
+            &mut seen,
+            max_findings,
+        );
+        if findings.len() >= max_findings {
+            return findings;
+        }
+
+        for (tool_idx, tool) in turn.tool_invocations.iter().enumerate() {
+            let tool_number = tool_idx + 1;
+            let prefix = format!("turn {turn_number} tool {tool_number}");
+
+            scan_text_for_secrets(
+                &format!("{prefix} input"),
+                &tool.input_display,
+                &mut findings,
+                &mut seen,
+                max_findings,
+            );
+            if findings.len() >= max_findings {
+                return findings;
+            }
+
+            scan_text_for_secrets(
+                &format!("{prefix} output"),
+                &tool.output_display,
+                &mut findings,
+                &mut seen,
+                max_findings,
+            );
+            if findings.len() >= max_findings {
+                return findings;
+            }
+
+            if let Ok(tool_json) = serde_json::to_string(&tool.tool_type) {
+                scan_text_for_secrets(
+                    &format!("{prefix} metadata"),
+                    &tool_json,
+                    &mut findings,
+                    &mut seen,
+                    max_findings,
+                );
+                if findings.len() >= max_findings {
+                    return findings;
+                }
+            }
+
+            if !tool.raw_input.is_null() {
+                scan_text_for_secrets(
+                    &format!("{prefix} raw input"),
+                    &tool.raw_input.to_string(),
+                    &mut findings,
+                    &mut seen,
+                    max_findings,
+                );
+                if findings.len() >= max_findings {
+                    return findings;
+                }
+            }
+
+            if let Some(raw_output) = &tool.raw_output {
+                scan_text_for_secrets(
+                    &format!("{prefix} raw output"),
+                    &raw_output.to_string(),
+                    &mut findings,
+                    &mut seen,
+                    max_findings,
+                );
+                if findings.len() >= max_findings {
+                    return findings;
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+/// Scan raw source session files for likely secrets.
+///
+/// This is used as a fallback when parsed-session scanning misses values that
+/// may have been truncated or transformed by parsers.
+#[must_use]
+pub fn scan_paths_for_secrets(paths: &[PathBuf], max_findings: usize) -> Vec<SecretScanFinding> {
+    let max_findings = max_findings.max(1);
+    let mut findings = Vec::new();
+    let mut seen = HashSet::new();
+
+    for path in paths {
+        if findings.len() >= max_findings {
+            break;
+        }
+
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let location = format!("source file {}", path.display());
+        scan_text_for_secrets(&location, &text, &mut findings, &mut seen, max_findings);
+    }
+
+    findings
+}
+
+fn scan_text_for_secrets(
+    location: &str,
+    text: &str,
+    findings: &mut Vec<SecretScanFinding>,
+    seen: &mut HashSet<String>,
+    max_findings: usize,
+) {
+    if text.is_empty() || findings.len() >= max_findings {
+        return;
+    }
+
+    if contains_private_key_block(text) {
+        record_secret_finding(
+            findings,
+            seen,
+            max_findings,
+            "Private key block",
+            location,
+            "-----BEGIN ... PRIVATE KEY-----",
+        );
+        if findings.len() >= max_findings {
+            return;
+        }
+    }
+
+    for token in text.split(|ch: char| !is_secret_token_char(ch)) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        if let Some((detector, secret)) = detect_secret_token(token) {
+            record_secret_finding(findings, seen, max_findings, detector, location, secret);
+            if findings.len() >= max_findings {
+                return;
+            }
+        }
+    }
+
+    for line in text.lines() {
+        if let Some(token) = extract_bearer_token(line) {
+            record_secret_finding(
+                findings,
+                seen,
+                max_findings,
+                "Bearer token",
+                location,
+                token,
+            );
+            if findings.len() >= max_findings {
+                return;
+            }
+        }
+
+        if let Some(value) = extract_labeled_secret(line) {
+            record_secret_finding(
+                findings,
+                seen,
+                max_findings,
+                "Labeled secret value",
+                location,
+                value,
+            );
+            if findings.len() >= max_findings {
+                return;
+            }
+        }
+    }
+}
+
+fn record_secret_finding(
+    findings: &mut Vec<SecretScanFinding>,
+    seen: &mut HashSet<String>,
+    max_findings: usize,
+    detector: &'static str,
+    location: &str,
+    secret: &str,
+) {
+    if findings.len() >= max_findings {
+        return;
+    }
+    if looks_like_placeholder(secret) {
+        return;
+    }
+
+    let dedupe_key = format!("{detector}:{secret}");
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+
+    findings.push(SecretScanFinding {
+        detector,
+        location: location.to_string(),
+        sample: redact_secret(secret),
+    });
+}
+
+fn contains_private_key_block(text: &str) -> bool {
+    text.contains("-----BEGIN ") && text.contains(" PRIVATE KEY-----")
+}
+
+fn is_secret_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '+' | '/')
+}
+
+fn is_secret_value_char(ch: char) -> bool {
+    is_secret_token_char(ch) || ch == '='
+}
+
+fn detect_secret_token(token: &str) -> Option<(&'static str, &str)> {
+    if looks_like_placeholder(token) {
+        return None;
+    }
+
+    const GH_PREFIXES: [&str; 5] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+    for prefix in GH_PREFIXES {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            if rest.len() == 36 && rest.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+                return Some(("GitHub token", token));
+            }
+        }
+    }
+
+    if let Some(rest) = token.strip_prefix("github_pat_") {
+        if rest.len() >= 20
+            && rest
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Some(("GitHub fine-grained token", token));
+        }
+    }
+
+    if let Some(rest) = token.strip_prefix("sk-ant-") {
+        if rest.len() >= 20
+            && rest
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Some(("Anthropic API key", token));
+        }
+    }
+
+    if let Some(rest) = token.strip_prefix("sk-proj-") {
+        if rest.len() >= 20
+            && rest
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Some(("OpenAI API key", token));
+        }
+    }
+
+    if token.len() == 20
+        && (token.starts_with("AKIA") || token.starts_with("ASIA"))
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    {
+        return Some(("AWS access key ID", token));
+    }
+
+    if token.starts_with("AIza")
+        && token.len() == 39
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Some(("Google API key", token));
+    }
+
+    const SLACK_PREFIXES: [&str; 5] = ["xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-"];
+    for prefix in SLACK_PREFIXES {
+        if let Some(rest) = token.strip_prefix(prefix) {
+            if rest.len() >= 24
+                && rest
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+            {
+                return Some(("Slack token", token));
+            }
+        }
+    }
+
+    if let Some(rest) = token.strip_prefix("sk-") {
+        if rest.len() >= 24
+            && rest
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            && rest.chars().any(|ch| ch.is_ascii_digit())
+        {
+            return Some(("API key", token));
+        }
+    }
+
+    None
+}
+
+fn extract_bearer_token(line: &str) -> Option<&str> {
+    let lower = line.to_ascii_lowercase();
+    let idx = lower.find("bearer ")?;
+    let token_part = line[idx + "bearer ".len()..].trim_start();
+    let token = token_part
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | ']' | '}'))
+        .next()
+        .unwrap_or("")
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`');
+
+    if looks_like_secret_value(token) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+fn extract_labeled_secret(line: &str) -> Option<&str> {
+    let lower = line.to_ascii_lowercase();
+    if !contains_secret_label(&lower) {
+        return None;
+    }
+
+    let value = line
+        .split_once('=')
+        .map(|(_, rhs)| rhs)
+        .or_else(|| line.split_once(':').map(|(_, rhs)| rhs))?
+        .trim_start();
+
+    let token = value
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .trim_start_matches("Bearer ")
+        .trim_start_matches("bearer ")
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | ']' | '}'))
+        .next()
+        .unwrap_or("");
+
+    if looks_like_secret_value(token) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+fn contains_secret_label(lower_line: &str) -> bool {
+    const LABELS: [&str; 9] = [
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "client_secret",
+        "secret_key",
+        "authorization",
+        "password",
+        "token",
+    ];
+    LABELS.iter().any(|label| lower_line.contains(label))
+}
+
+fn looks_like_secret_value(value: &str) -> bool {
+    if value.len() < 24 || looks_like_placeholder(value) || value.contains("://") {
+        return false;
+    }
+    if !value.chars().all(is_secret_value_char) {
+        return false;
+    }
+    let has_alpha = value.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = value.chars().any(|ch| ch.is_ascii_digit());
+    has_alpha && has_digit
+}
+
+fn looks_like_placeholder(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.is_empty()
+        || lower.contains("${")
+        || lower.contains("{{")
+        || lower.contains("<")
+        || lower.contains(">")
+        || lower.contains("example")
+        || lower.contains("placeholder")
+        || lower.contains("your_")
+        || lower.contains("token_here")
+        || lower.contains("redacted")
+        || lower == "null"
+        || lower == "undefined"
+}
+
+fn redact_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() <= 10 {
+        return "[hidden]".to_string();
+    }
+    let prefix: String = chars[..4].iter().collect();
+    let suffix: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("{prefix}...{suffix}")
 }
 
 #[must_use]
@@ -831,6 +1298,26 @@ mod tests {
     use super::*;
     use crate::models::{SessionSource, Turn};
 
+    fn test_session_with_text(prompt: &str, response: &str) -> Session {
+        Session {
+            id: "scan-test".to_string(),
+            name: "scan".to_string(),
+            source: SessionSource::Other {
+                name: "x".to_string(),
+            },
+            project_path: None,
+            turns: vec![Turn {
+                id: "t1".to_string(),
+                timestamp: None,
+                user_prompt: prompt.to_string(),
+                thinking: None,
+                tool_invocations: Vec::new(),
+                response: response.to_string(),
+                model: None,
+            }],
+        }
+    }
+
     #[test]
     fn test_compress_decompress_roundtrip() {
         let session = Session {
@@ -1060,6 +1547,95 @@ mod tests {
         assert_eq!(
             session_fingerprint(&session_a).unwrap(),
             session_fingerprint(&session_b).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_scan_session_for_secrets_detects_github_token() {
+        let token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let session = test_session_with_text(&format!("token={token}"), "ok");
+
+        let findings = scan_session_for_secrets(&session, 5);
+        assert!(!findings.is_empty());
+        assert!(findings.iter().any(|f| f.detector == "GitHub token"));
+    }
+
+    #[test]
+    fn test_scan_session_for_secrets_detects_private_key_block() {
+        let response = "-----BEGIN PRIVATE KEY-----\nABCDEF\n-----END PRIVATE KEY-----";
+        let session = test_session_with_text("hello", response);
+
+        let findings = scan_session_for_secrets(&session, 5);
+        assert!(findings.iter().any(|f| f.detector == "Private key block"));
+    }
+
+    #[test]
+    fn test_scan_session_for_secrets_ignores_placeholders() {
+        let prompt = "Authorization: Bearer ${API_KEY}\napi_key=YOUR_API_KEY_HERE";
+        let session = test_session_with_text(prompt, "example only");
+
+        let findings = scan_session_for_secrets(&session, 5);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn test_scan_session_for_secrets_respects_limit() {
+        let prompt = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\nAKIAABCDEFGHIJKLMNOP";
+        let session = test_session_with_text(prompt, "ok");
+
+        let findings = scan_session_for_secrets(&session, 1);
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_paths_for_secrets_detects_private_key_block() {
+        use std::io::Write as _;
+
+        let file_path = std::env::temp_dir().join(format!(
+            "vibereview-secret-scan-{}-{}.jsonl",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        {
+            let mut file = std::fs::File::create(&file_path).unwrap();
+            writeln!(
+                file,
+                "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+            )
+            .unwrap();
+        }
+
+        let findings = scan_paths_for_secrets(std::slice::from_ref(&file_path), 5);
+        let _ = std::fs::remove_file(&file_path);
+
+        assert!(
+            findings.iter().any(|f| f.detector == "Private key block"),
+            "expected private key block finding, got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn test_scan_paths_for_secrets_detects_github_token() {
+        use std::io::Write as _;
+
+        let file_path = std::env::temp_dir().join(format!(
+            "vibereview-secret-scan-token-{}-{}.jsonl",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        {
+            let mut file = std::fs::File::create(&file_path).unwrap();
+            writeln!(file, "token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").unwrap();
+        }
+
+        let findings = scan_paths_for_secrets(std::slice::from_ref(&file_path), 5);
+        let _ = std::fs::remove_file(&file_path);
+
+        assert!(
+            findings.iter().any(|f| f.detector == "GitHub token"),
+            "expected GitHub token finding, got: {findings:?}"
         );
     }
 }

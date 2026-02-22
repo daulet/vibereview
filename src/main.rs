@@ -7,6 +7,7 @@ mod share;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use color_eyre::{eyre::eyre, Result};
@@ -43,6 +44,7 @@ const SEARCH_CURRENT_BG: Color = Color::Yellow;
 /// Foreground color for the current/active search match
 const SEARCH_CURRENT_FG: Color = Color::Black;
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1500);
+const UPLOAD_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -203,6 +205,10 @@ pub enum UploadState {
         cloud_security: CloudShareSecurity,
         focus: ShareDialogSection,
     },
+    SecretScanning,
+    SecretConfirming {
+        findings: Vec<share::SecretScanFinding>,
+    },
     Compressing {
         target: ShareTarget,
     },
@@ -217,6 +223,47 @@ pub enum UploadState {
     },
     Error {
         message: String,
+    },
+}
+
+#[derive(Debug)]
+struct PendingCloudUpload {
+    session: Session,
+    api_url: String,
+    auth_token: String,
+    cloud_security: CloudShareSecurity,
+}
+
+#[derive(Debug)]
+struct FileExportResult {
+    location: String,
+    resumable: bool,
+}
+
+#[derive(Debug)]
+struct CloudUploadResult {
+    location: String,
+    cloud_security: CloudShareSecurity,
+    reused: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UploadWorkerProgress {
+    Compressing(ShareTarget),
+    Uploading(ShareTarget),
+}
+
+#[derive(Debug)]
+enum UploadWorkerMessage {
+    SecretScanFinished {
+        findings: Vec<share::SecretScanFinding>,
+    },
+    Progress(UploadWorkerProgress),
+    FileExportFinished {
+        result: std::result::Result<FileExportResult, String>,
+    },
+    CloudUploadFinished {
+        result: std::result::Result<CloudUploadResult, String>,
     },
 }
 
@@ -682,6 +729,8 @@ pub struct App {
     pub selection_scroll_offset: u16,
     /// Search state (active when Some)
     pub search: Option<SearchState>,
+    upload_worker_rx: Option<Receiver<UploadWorkerMessage>>,
+    pending_cloud_upload: Option<PendingCloudUpload>,
 }
 
 impl Default for App {
@@ -716,6 +765,8 @@ impl App {
             content_lines: Vec::new(),
             selection_scroll_offset: 0,
             search: None,
+            upload_worker_rx: None,
+            pending_cloud_upload: None,
         }
     }
 
@@ -759,9 +810,20 @@ impl App {
 
     #[must_use]
     fn next_timer_deadline(&self) -> Option<Instant> {
-        self.copy_feedback
+        let copy_deadline = self
+            .copy_feedback
             .as_ref()
-            .map(|f| f.timestamp + COPY_FEEDBACK_DURATION)
+            .map(|f| f.timestamp + COPY_FEEDBACK_DURATION);
+
+        if self.upload_worker_rx.is_none() {
+            return copy_deadline;
+        }
+
+        let worker_deadline = Instant::now() + UPLOAD_WORKER_POLL_INTERVAL;
+        Some(match copy_deadline {
+            Some(deadline) => deadline.min(worker_deadline),
+            None => worker_deadline,
+        })
     }
 
     fn process_timers(&mut self) -> bool {
@@ -774,7 +836,112 @@ impl App {
             self.copy_feedback = None;
             changed = true;
         }
+        if self.process_upload_worker_message() {
+            changed = true;
+        }
         changed
+    }
+
+    fn process_upload_worker_message(&mut self) -> bool {
+        let recv_result = match self.upload_worker_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv_result {
+            Ok(msg) => {
+                self.handle_upload_worker_message(msg);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.upload_worker_rx = None;
+                if matches!(
+                    self.upload_state,
+                    UploadState::SecretScanning
+                        | UploadState::Compressing { .. }
+                        | UploadState::Uploading { .. }
+                ) {
+                    self.pending_cloud_upload = None;
+                    self.upload_state = UploadState::Error {
+                        message: "Share worker stopped unexpectedly.".to_string(),
+                    };
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn handle_upload_worker_message(&mut self, msg: UploadWorkerMessage) {
+        match msg {
+            UploadWorkerMessage::SecretScanFinished { findings } => {
+                self.upload_worker_rx = None;
+                let Some(pending) = self.pending_cloud_upload.take() else {
+                    self.upload_state = UploadState::Error {
+                        message: "Cloud upload context expired. Retry sharing.".to_string(),
+                    };
+                    return;
+                };
+
+                if findings.is_empty() {
+                    self.start_cloud_upload_worker(pending);
+                } else {
+                    self.pending_cloud_upload = Some(pending);
+                    self.upload_state = UploadState::SecretConfirming { findings };
+                }
+            }
+            UploadWorkerMessage::Progress(progress) => match progress {
+                UploadWorkerProgress::Compressing(target) => {
+                    self.upload_state = UploadState::Compressing { target };
+                }
+                UploadWorkerProgress::Uploading(target) => {
+                    self.upload_state = UploadState::Uploading { target };
+                }
+            },
+            UploadWorkerMessage::FileExportFinished { result } => {
+                self.upload_worker_rx = None;
+                match result {
+                    Ok(done) => {
+                        let _ = share::copy_to_clipboard(&done.location);
+                        self.upload_state = UploadState::Complete {
+                            target: ShareTarget::File,
+                            location: done.location,
+                            resumable: done.resumable,
+                            cloud_security: None,
+                        };
+                    }
+                    Err(message) => {
+                        self.upload_state = UploadState::Error { message };
+                    }
+                }
+            }
+            UploadWorkerMessage::CloudUploadFinished { result } => {
+                self.upload_worker_rx = None;
+                self.pending_cloud_upload = None;
+                match result {
+                    Ok(done) => {
+                        let _ = share::copy_to_clipboard(&done.location);
+                        self.upload_state = UploadState::Complete {
+                            target: ShareTarget::Cloud,
+                            location: done.location,
+                            resumable: false,
+                            cloud_security: Some(done.cloud_security),
+                        };
+                        if done.reused {
+                            self.error_message = Some(
+                                "Reused existing cloud link for this unchanged session."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Err(message) => {
+                        self.upload_state = UploadState::Error { message };
+                    }
+                }
+            }
+        }
     }
 
     fn select_next_in_list(state: &mut ListState, len: usize) {
@@ -838,6 +1005,7 @@ impl App {
 
     fn handle_upload_key(&mut self, key: KeyCode) {
         match self.upload_state.clone() {
+            UploadState::Idle => {}
             UploadState::Confirming {
                 mut target,
                 mut mode,
@@ -887,12 +1055,11 @@ impl App {
                         );
                     }
                     KeyCode::Enter | KeyCode::Char('y') => {
-                        self.perform_upload(target, mode, cloud_api_url.as_deref(), cloud_security);
+                        self.begin_upload(target, mode, cloud_api_url.as_deref(), cloud_security);
                         return;
                     }
                     KeyCode::Esc | KeyCode::Char('n') => {
-                        self.upload_state = UploadState::Idle;
-                        self.text_selection = None;
+                        self.cancel_upload_operation();
                         return;
                     }
                     _ => {}
@@ -907,12 +1074,26 @@ impl App {
                     focus,
                 };
             }
+            UploadState::SecretConfirming { .. } => match key {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    self.approve_secrets_and_continue_upload();
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.cancel_upload_operation();
+                }
+                _ => {}
+            },
+            UploadState::SecretScanning
+            | UploadState::Compressing { .. }
+            | UploadState::Uploading { .. } => {
+                if matches!(key, KeyCode::Esc | KeyCode::Char('n')) {
+                    self.cancel_upload_operation();
+                }
+            }
             UploadState::Complete { .. } | UploadState::Error { .. } => {
                 // Any key dismisses the result
-                self.upload_state = UploadState::Idle;
-                self.text_selection = None;
+                self.cancel_upload_operation();
             }
-            _ => {}
         }
     }
 
@@ -940,39 +1121,24 @@ impl App {
         }
     }
 
-    fn perform_upload(
+    fn begin_upload(
         &mut self,
         target: ShareTarget,
         mode: share::ShareExportMode,
         cloud_api_url: Option<&str>,
         cloud_security: CloudShareSecurity,
     ) {
-        let selected_session = self.selected_unified_session().cloned().or_else(|| {
-            self.current_session_index
-                .and_then(|i| self.sessions.get(i).cloned())
-        });
+        self.text_selection = None;
+        self.upload_worker_rx = None;
+        self.pending_cloud_upload = None;
 
-        let Some(selected) = selected_session else {
-            self.upload_state = UploadState::Error {
-                message: "No session selected".to_string(),
-            };
-            return;
+        let (selected, session) = match self.resolve_upload_context() {
+            Ok(ctx) => ctx,
+            Err(message) => {
+                self.upload_state = UploadState::Error { message };
+                return;
+            }
         };
-
-        let session = match &self.session {
-            Some(s) => s.clone(),
-            None => match selected.parse() {
-                Ok(s) => s,
-                Err(e) => {
-                    self.upload_state = UploadState::Error {
-                        message: format!("Failed to parse session: {e}"),
-                    };
-                    return;
-                }
-            },
-        };
-
-        self.upload_state = UploadState::Compressing { target };
 
         match target {
             ShareTarget::Cloud => {
@@ -981,16 +1147,6 @@ impl App {
                         message: "Cloud share endpoint is unavailable.".to_string(),
                     };
                     return;
-                };
-
-                let compressed = match share::compress_session(&session) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        self.upload_state = UploadState::Error {
-                            message: format!("Compression failed: {e}"),
-                        };
-                        return;
-                    }
                 };
 
                 let auth_token = match auth::load_auth_token() {
@@ -1006,127 +1162,87 @@ impl App {
                     }
                 };
 
-                let fingerprint = match share::session_fingerprint(&session) {
-                    Ok(fingerprint) => fingerprint,
-                    Err(e) => {
-                        self.upload_state = UploadState::Error {
-                            message: format!("Failed to fingerprint session: {e}"),
-                        };
-                        return;
+                self.pending_cloud_upload = Some(PendingCloudUpload {
+                    session: session.clone(),
+                    api_url: api_url.to_string(),
+                    auth_token,
+                    cloud_security,
+                });
+                self.upload_state = UploadState::SecretScanning;
+                self.spawn_upload_worker(move |tx| {
+                    let mut findings = share::scan_session_for_secrets(&session, 5);
+                    if findings.is_empty() {
+                        findings = share::scan_paths_for_secrets(&selected.paths, 5);
                     }
-                };
-
-                let security = match cloud_security {
-                    CloudShareSecurity::Encrypted => "encrypted",
-                    CloudShareSecurity::Public => "public",
-                };
-
-                let mut share_key = None;
-                let payload = match cloud_security {
-                    CloudShareSecurity::Encrypted => {
-                        let key = share::generate_cloud_share_key();
-                        let payload = match share::encrypt_cloud_payload(&compressed, &key) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                self.upload_state = UploadState::Error {
-                                    message: format!("Encryption failed: {e}"),
-                                };
-                                return;
-                            }
-                        };
-                        share_key = Some(key);
-                        payload
-                    }
-                    CloudShareSecurity::Public => compressed,
-                };
-
-                self.upload_state = UploadState::Uploading { target };
-
-                match share::upload_session(
-                    &payload,
-                    api_url,
-                    &auth_token,
-                    &fingerprint,
-                    &session.name,
-                    session.turns.len(),
-                    security,
-                ) {
-                    Ok(response) => {
-                        let base_url = share::normalize_share_url(&response.url);
-                        let share_url = match share_key {
-                            Some(key) => share::attach_key_to_share_url(&base_url, &key),
-                            None => base_url,
-                        };
-                        let _ = share::copy_to_clipboard(&share_url);
-                        self.upload_state = UploadState::Complete {
-                            target,
-                            location: share_url,
-                            resumable: false,
-                            cloud_security: Some(cloud_security),
-                        };
-                        if response.reused {
-                            self.error_message = Some(
-                                "Reused existing cloud link for this unchanged session."
-                                    .to_string(),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        self.upload_state = UploadState::Error {
-                            message: format!("Upload failed: {e}"),
-                        };
-                    }
-                }
+                    let _ = tx.send(UploadWorkerMessage::SecretScanFinished { findings });
+                });
             }
             ShareTarget::File => {
-                let resume_input = if mode.is_resumable() {
-                    Some(share::ResumeBundleInput {
-                        source: match selected.source {
-                            Source::Claude => share::ResumeSource::Claude,
-                            Source::Codex => share::ResumeSource::Codex,
-                        },
-                        resume_session_id: selected.resume_session_id(),
-                        resume_command: selected.get_resume_command(),
-                        project_path_hint: selected.project_path.clone(),
-                        session_paths: selected.paths.clone(),
-                    })
-                } else {
-                    None
+                self.upload_state = UploadState::Compressing {
+                    target: ShareTarget::File,
                 };
-
-                let compressed =
-                    match share::build_share_file(&session, mode, resume_input.as_ref()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            self.upload_state = UploadState::Error {
-                                message: format!("Export failed: {e}"),
-                            };
-                            return;
-                        }
-                    };
-
-                self.upload_state = UploadState::Uploading { target };
-
-                let path = share::default_share_file_path(&selected.name, mode);
-                match share::write_share_file(&path, &compressed) {
-                    Ok(()) => {
-                        let path_str = path.display().to_string();
-                        let _ = share::copy_to_clipboard(&path_str);
-                        self.upload_state = UploadState::Complete {
-                            target,
-                            location: path_str,
-                            resumable: mode.is_resumable(),
-                            cloud_security: None,
-                        };
-                    }
-                    Err(e) => {
-                        self.upload_state = UploadState::Error {
-                            message: format!("Save failed: {e}"),
-                        };
-                    }
-                }
+                self.spawn_upload_worker(move |tx| {
+                    let result = run_file_export_job(session, selected, mode, &tx);
+                    let _ = tx.send(UploadWorkerMessage::FileExportFinished { result });
+                });
             }
         }
+    }
+
+    fn resolve_upload_context(&self) -> std::result::Result<(UnifiedSession, Session), String> {
+        let selected = self
+            .selected_unified_session()
+            .cloned()
+            .or_else(|| {
+                self.current_session_index
+                    .and_then(|i| self.sessions.get(i).cloned())
+            })
+            .ok_or_else(|| "No session selected".to_string())?;
+
+        let session = match &self.session {
+            Some(s) => s.clone(),
+            None => selected
+                .parse()
+                .map_err(|e| format!("Failed to parse session: {e}"))?,
+        };
+
+        Ok((selected, session))
+    }
+
+    fn approve_secrets_and_continue_upload(&mut self) {
+        let Some(pending) = self.pending_cloud_upload.take() else {
+            self.upload_state = UploadState::Error {
+                message: "Cloud upload context expired. Retry sharing.".to_string(),
+            };
+            return;
+        };
+        self.start_cloud_upload_worker(pending);
+    }
+
+    fn start_cloud_upload_worker(&mut self, pending: PendingCloudUpload) {
+        self.upload_state = UploadState::Compressing {
+            target: ShareTarget::Cloud,
+        };
+        self.spawn_upload_worker(move |tx| {
+            let result = run_cloud_upload_job(pending, &tx);
+            let _ = tx.send(UploadWorkerMessage::CloudUploadFinished { result });
+        });
+    }
+
+    fn spawn_upload_worker<F>(&mut self, job: F)
+    where
+        F: FnOnce(mpsc::Sender<UploadWorkerMessage>) + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        self.upload_worker_rx = Some(rx);
+        std::thread::spawn(move || job(tx));
+    }
+
+    fn cancel_upload_operation(&mut self) {
+        self.upload_state = UploadState::Idle;
+        self.text_selection = None;
+        self.upload_worker_rx = None;
+        self.pending_cloud_upload = None;
     }
 
     fn selected_unified_session(&self) -> Option<&UnifiedSession> {
@@ -1984,6 +2100,21 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
                 false,
             )
         }
+        UploadState::SecretScanning => (
+            " Secret Scan ",
+            "Scanning session for potential secrets...\n\n\
+            This runs locally before any cloud upload.\n\n\
+            Press Esc or 'n' to cancel."
+                .to_string(),
+            Style::default().fg(Color::Cyan),
+            false,
+        ),
+        UploadState::SecretConfirming { findings } => (
+            " Secrets Detected ",
+            format_secret_scan_findings(findings),
+            Style::default().fg(Color::Yellow),
+            false,
+        ),
         UploadState::Compressing { target } => match target {
             ShareTarget::Cloud => (
                 " Sharing... ",
@@ -2343,6 +2474,124 @@ fn viewer_help_text(is_subagent_view: bool, can_resume: bool) -> String {
             " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy{resume} | Enter: Open | q: Quit "
         )
     }
+}
+
+fn format_secret_scan_findings(findings: &[share::SecretScanFinding]) -> String {
+    const DISPLAY_LIMIT: usize = 3;
+    let mut lines = vec![
+        "Potential secrets detected in this session.".to_string(),
+        String::new(),
+    ];
+
+    for finding in findings.iter().take(DISPLAY_LIMIT) {
+        lines.push(format!("- {}", finding.summary()));
+    }
+    if findings.len() > DISPLAY_LIMIT {
+        lines.push(format!("- ... and {} more", findings.len() - DISPLAY_LIMIT));
+    }
+
+    lines.push(String::new());
+    lines.push("Upload anyway?".to_string());
+    lines.push("Enter or 'y': continue upload".to_string());
+    lines.push("Esc or 'n': cancel".to_string());
+    lines.join("\n")
+}
+
+fn run_file_export_job(
+    session: Session,
+    selected: UnifiedSession,
+    mode: share::ShareExportMode,
+    tx: &mpsc::Sender<UploadWorkerMessage>,
+) -> std::result::Result<FileExportResult, String> {
+    let _ = tx.send(UploadWorkerMessage::Progress(
+        UploadWorkerProgress::Compressing(ShareTarget::File),
+    ));
+
+    let resume_input = if mode.is_resumable() {
+        Some(share::ResumeBundleInput {
+            source: match selected.source {
+                Source::Claude => share::ResumeSource::Claude,
+                Source::Codex => share::ResumeSource::Codex,
+            },
+            resume_session_id: selected.resume_session_id(),
+            resume_command: selected.get_resume_command(),
+            project_path_hint: selected.project_path.clone(),
+            session_paths: selected.paths.clone(),
+        })
+    } else {
+        None
+    };
+
+    let payload = share::build_share_file(&session, mode, resume_input.as_ref())
+        .map_err(|e| format!("Export failed: {e}"))?;
+
+    let path = share::default_share_file_path(&selected.name, mode);
+    let _ = tx.send(UploadWorkerMessage::Progress(
+        UploadWorkerProgress::Uploading(ShareTarget::File),
+    ));
+    share::write_share_file(&path, &payload).map_err(|e| format!("Save failed: {e}"))?;
+
+    Ok(FileExportResult {
+        location: path.display().to_string(),
+        resumable: mode.is_resumable(),
+    })
+}
+
+fn run_cloud_upload_job(
+    pending: PendingCloudUpload,
+    tx: &mpsc::Sender<UploadWorkerMessage>,
+) -> std::result::Result<CloudUploadResult, String> {
+    let _ = tx.send(UploadWorkerMessage::Progress(
+        UploadWorkerProgress::Compressing(ShareTarget::Cloud),
+    ));
+    let compressed = share::compress_session(&pending.session)
+        .map_err(|e| format!("Compression failed: {e}"))?;
+
+    let fingerprint = share::session_fingerprint(&pending.session)
+        .map_err(|e| format!("Failed to fingerprint session: {e}"))?;
+
+    let security = match pending.cloud_security {
+        CloudShareSecurity::Encrypted => "encrypted",
+        CloudShareSecurity::Public => "public",
+    };
+
+    let mut share_key = None;
+    let payload = match pending.cloud_security {
+        CloudShareSecurity::Encrypted => {
+            let key = share::generate_cloud_share_key();
+            let payload = share::encrypt_cloud_payload(&compressed, &key)
+                .map_err(|e| format!("Encryption failed: {e}"))?;
+            share_key = Some(key);
+            payload
+        }
+        CloudShareSecurity::Public => compressed,
+    };
+
+    let _ = tx.send(UploadWorkerMessage::Progress(
+        UploadWorkerProgress::Uploading(ShareTarget::Cloud),
+    ));
+    let response = share::upload_session(
+        &payload,
+        &pending.api_url,
+        &pending.auth_token,
+        &fingerprint,
+        &pending.session.name,
+        pending.session.turns.len(),
+        security,
+    )
+    .map_err(|e| format!("Upload failed: {e}"))?;
+
+    let base_url = share::normalize_share_url(&response.url);
+    let location = match share_key {
+        Some(key) => share::attach_key_to_share_url(&base_url, &key),
+        None => base_url,
+    };
+
+    Ok(CloudUploadResult {
+        location,
+        cloud_security: pending.cloud_security,
+        reused: response.reused,
+    })
 }
 
 fn render_session_viewer(frame: &mut Frame, app: &mut App) {
@@ -3437,7 +3686,9 @@ fn main() -> Result<()> {
                 }
                 _ => {}
             }
-        } else if app.process_timers() {
+        }
+
+        if app.process_timers() {
             needs_redraw = true;
         }
     }
