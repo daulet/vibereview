@@ -3,12 +3,34 @@ import { nanoid } from 'nanoid';
 export interface Env {
   SESSIONS: R2Bucket;
   CORS_ORIGIN: string;
+  GITHUB_CLIENT_ID: string;
 }
 
 // Rate limiting: Track uploads per IP (in-memory, resets on worker restart)
 const uploadCounts = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT = 10; // uploads per hour
 const RATE_WINDOW = 60 * 60 * 1000; // 1 hour in ms
+const AUTH_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const authCache = new Map<string, { user: GitHubUser; expiresAt: number }>();
+
+interface GitHubUser {
+  id: number;
+  login: string;
+}
+
+interface UploadRecord {
+  id: string;
+  fingerprint: string;
+  security: 'encrypted' | 'public';
+  session_name?: string;
+  turn_count?: number;
+  uploaded_at: string;
+}
+
+interface UserUploadIndex {
+  version: 1;
+  uploads: UploadRecord[];
+}
 
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
@@ -31,7 +53,9 @@ function corsHeaders(env: Env): HeadersInit {
   return {
     'Access-Control-Allow-Origin': env.CORS_ORIGIN,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Content-Encoding',
+    'Access-Control-Allow-Headers':
+      'Content-Type, Authorization, X-Session-Fingerprint, X-Session-Name, X-Session-Turn-Count, X-Share-Security',
+    Vary: 'Origin',
   };
 }
 
@@ -49,8 +73,16 @@ export default {
     }
 
     // API Routes
+    if (path === '/api/auth/github/client-id' && request.method === 'GET') {
+      return handleGitHubClientId(env);
+    }
+
     if (path === '/api/sessions' && request.method === 'POST') {
       return handleUpload(request, env);
+    }
+
+    if (path === '/api/uploads' && request.method === 'GET') {
+      return handleListUploads(request, env);
     }
 
     if (path.startsWith('/api/sessions/') && request.method === 'GET') {
@@ -73,7 +105,195 @@ export default {
   },
 };
 
+function securityFromHeader(value: string | null): 'encrypted' | 'public' {
+  if (value?.toLowerCase() === 'public') {
+    return 'public';
+  }
+  return 'encrypted';
+}
+
+function userIndexKey(userId: number): string {
+  return `users/${userId}.json`;
+}
+
+async function loadUserIndex(env: Env, userId: number): Promise<UserUploadIndex> {
+  const object = await env.SESSIONS.get(userIndexKey(userId));
+  if (!object) {
+    return { version: 1, uploads: [] };
+  }
+  try {
+    const parsed = JSON.parse(await object.text()) as UserUploadIndex;
+    if (parsed.version === 1 && Array.isArray(parsed.uploads)) {
+      return parsed;
+    }
+    return { version: 1, uploads: [] };
+  } catch {
+    return { version: 1, uploads: [] };
+  }
+}
+
+async function saveUserIndex(env: Env, userId: number, index: UserUploadIndex): Promise<void> {
+  await env.SESSIONS.put(userIndexKey(userId), JSON.stringify(index), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+}
+
+async function authenticateGitHubUser(accessToken: string): Promise<GitHubUser | null> {
+  const now = Date.now();
+  const cached = authCache.get(accessToken);
+  if (cached && cached.expiresAt > now) {
+    return cached.user;
+  }
+
+  const response = await fetch('https://api.github.com/user', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'vibereview-worker',
+    },
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const body = (await response.json()) as GitHubUser;
+  if (!body || typeof body.id !== 'number' || typeof body.login !== 'string') {
+    return null;
+  }
+
+  authCache.set(accessToken, { user: body, expiresAt: now + AUTH_CACHE_TTL });
+  return body;
+}
+
+async function requireUser(request: Request, env: Env): Promise<GitHubUser | Response> {
+  const auth = request.headers.get('Authorization') || '';
+  const prefix = 'Bearer ';
+  if (!auth.startsWith(prefix)) {
+    return new Response(JSON.stringify({ error: 'Missing bearer token' }), {
+      status: 401,
+      headers: {
+        ...corsHeaders(env),
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+
+  const token = auth.slice(prefix.length).trim();
+  if (!token) {
+    return new Response(JSON.stringify({ error: 'Missing bearer token' }), {
+      status: 401,
+      headers: {
+        ...corsHeaders(env),
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+
+  const user = await authenticateGitHubUser(token);
+  if (!user) {
+    return new Response(JSON.stringify({ error: 'Invalid GitHub token' }), {
+      status: 401,
+      headers: {
+        ...corsHeaders(env),
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+
+  return user;
+}
+
+function handleGitHubClientId(env: Env): Response {
+  const clientId = (env.GITHUB_CLIENT_ID || '').trim();
+  if (!clientId) {
+    return new Response(JSON.stringify({ error: 'GitHub login is not configured' }), {
+      status: 503,
+      headers: {
+        ...corsHeaders(env),
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+
+  return new Response(JSON.stringify({ client_id: clientId }), {
+    headers: {
+      ...corsHeaders(env),
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
+async function handleListUploads(request: Request, env: Env): Promise<Response> {
+  const authResult = await requireUser(request, env);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const index = await loadUserIndex(env, authResult.id);
+  const baseUrl = new URL(request.url).origin;
+  const uploads = index.uploads.map((item) => ({
+    ...item,
+    url: `${baseUrl}/s/${item.id}`,
+  }));
+
+  return new Response(JSON.stringify({ uploads }), {
+    headers: {
+      ...corsHeaders(env),
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
 async function handleUpload(request: Request, env: Env): Promise<Response> {
+  const authResult = await requireUser(request, env);
+  if (authResult instanceof Response) {
+    return authResult;
+  }
+
+  const fingerprint = request.headers.get('X-Session-Fingerprint')?.trim();
+  if (!fingerprint) {
+    return new Response(JSON.stringify({ error: 'Missing X-Session-Fingerprint header' }), {
+      status: 400,
+      headers: {
+        ...corsHeaders(env),
+        'Content-Type': 'application/json',
+      },
+    });
+  }
+
+  const security = securityFromHeader(request.headers.get('X-Share-Security'));
+  const sessionNameRaw = request.headers.get('X-Session-Name')?.trim();
+  const sessionName = sessionNameRaw ? sessionNameRaw.slice(0, 180) : undefined;
+  const turnCountRaw = request.headers.get('X-Session-Turn-Count');
+  const turnCount = turnCountRaw ? Number.parseInt(turnCountRaw, 10) : undefined;
+  const normalizedTurnCount =
+    typeof turnCount === 'number' && Number.isFinite(turnCount) && turnCount >= 0
+      ? turnCount
+      : undefined;
+
+  const index = await loadUserIndex(env, authResult.id);
+  const existing = index.uploads.find(
+    (item) => item.fingerprint === fingerprint && item.security === security
+  );
+  if (existing) {
+    const baseUrl = new URL(request.url).origin;
+    return new Response(
+      JSON.stringify({
+        id: existing.id,
+        url: `${baseUrl}/s/${existing.id}`,
+        reused: true,
+      }),
+      {
+        status: 200,
+        headers: {
+          ...corsHeaders(env),
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+  }
+
   // Check rate limit
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
   if (!checkRateLimit(ip)) {
@@ -111,6 +331,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   // Generate ID (12 chars, URL-safe)
   const id = nanoid(12);
+  const uploadedAt = new Date().toISOString();
 
   // Store in R2
   await env.SESSIONS.put(id, body, {
@@ -118,10 +339,28 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       contentType: 'application/octet-stream',
     },
     customMetadata: {
-      uploadedAt: new Date().toISOString(),
+      uploadedAt,
       ip: ip,
+      ownerId: String(authResult.id),
+      ownerLogin: authResult.login,
+      fingerprint,
+      security,
+      turnCount: normalizedTurnCount?.toString() ?? '',
+      sessionName: sessionName ?? '',
     },
   });
+
+  const newRecord: UploadRecord = {
+    id,
+    fingerprint,
+    security,
+    session_name: sessionName,
+    turn_count: normalizedTurnCount,
+    uploaded_at: uploadedAt,
+  };
+  index.uploads.unshift(newRecord);
+  index.uploads = index.uploads.slice(0, 1000);
+  await saveUserIndex(env, authResult.id, index);
 
   const baseUrl = new URL(request.url).origin;
   const shareUrl = `${baseUrl}/s/${id}`;
@@ -130,6 +369,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     JSON.stringify({
       id,
       url: shareUrl,
+      reused: false,
     }),
     {
       status: 201,

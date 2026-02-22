@@ -15,8 +15,25 @@ Harness for your AI harness. Browse Codex, Claude Code turns/tools/diffs, resume
 - Resume option (currently doesn't restore git state);
 - Share session as a file or as an encrypted cloud link;
 - Import shared session from a file or cloud share URL;
+- Login with GitHub from CLI for authenticated cloud uploads;
+- List your cloud uploads from the service (`vibereview uploads`);
 
 Cloud links default to encrypted and include a decryption key in URL fragment (`#k=...`).
 You can optionally switch to a public (unencrypted) cloud link in the share dialog.
 Keep the full URL to share or import via:
 `vibereview import "<share-url>"`.
+
+## Cloud Auth
+
+Cloud uploads require GitHub login:
+
+```bash
+export VIBEREVIEW_SHARE_API_URL="https://<worker-domain>/api/sessions"
+vibereview login
+```
+
+List uploads associated with your GitHub identity:
+
+```bash
+vibereview uploads
+```

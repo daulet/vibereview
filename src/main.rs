@@ -1,3 +1,4 @@
+mod auth;
 mod claude;
 mod codex;
 mod models;
@@ -48,6 +49,8 @@ const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 enum CliCommand {
     Browse,
     Import(PathBuf),
+    Login,
+    Uploads,
     Help,
 }
 
@@ -675,6 +678,8 @@ pub struct App {
     pub content_area: Option<Rect>,
     /// Content lines for text extraction (set during render)
     pub content_lines: Vec<String>,
+    /// Scroll offset associated with `content_lines` for selection mapping
+    pub selection_scroll_offset: u16,
     /// Search state (active when Some)
     pub search: Option<SearchState>,
 }
@@ -709,6 +714,7 @@ impl App {
             text_selection: None,
             content_area: None,
             content_lines: Vec::new(),
+            selection_scroll_offset: 0,
             search: None,
         }
     }
@@ -886,6 +892,7 @@ impl App {
                     }
                     KeyCode::Esc | KeyCode::Char('n') => {
                         self.upload_state = UploadState::Idle;
+                        self.text_selection = None;
                         return;
                     }
                     _ => {}
@@ -903,6 +910,7 @@ impl App {
             UploadState::Complete { .. } | UploadState::Error { .. } => {
                 // Any key dismisses the result
                 self.upload_state = UploadState::Idle;
+                self.text_selection = None;
             }
             _ => {}
         }
@@ -988,6 +996,34 @@ impl App {
                     }
                 };
 
+                let auth_token = match auth::load_auth_token() {
+                    Some(token) => token,
+                    None => {
+                        self.upload_state = UploadState::Error {
+                            message: format!(
+                                "Cloud upload requires login. Run `vibereview login` or set {}.",
+                                auth::GITHUB_TOKEN_ENV
+                            ),
+                        };
+                        return;
+                    }
+                };
+
+                let fingerprint = match share::session_fingerprint(&session) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(e) => {
+                        self.upload_state = UploadState::Error {
+                            message: format!("Failed to fingerprint session: {e}"),
+                        };
+                        return;
+                    }
+                };
+
+                let security = match cloud_security {
+                    CloudShareSecurity::Encrypted => "encrypted",
+                    CloudShareSecurity::Public => "public",
+                };
+
                 let mut share_key = None;
                 let payload = match cloud_security {
                     CloudShareSecurity::Encrypted => {
@@ -1009,11 +1045,20 @@ impl App {
 
                 self.upload_state = UploadState::Uploading { target };
 
-                match share::upload_session(&payload, api_url) {
+                match share::upload_session(
+                    &payload,
+                    api_url,
+                    &auth_token,
+                    &fingerprint,
+                    &session.name,
+                    session.turns.len(),
+                    security,
+                ) {
                     Ok(response) => {
+                        let base_url = share::normalize_share_url(&response.url);
                         let share_url = match share_key {
-                            Some(key) => share::attach_key_to_share_url(&response.url, &key),
-                            None => response.url,
+                            Some(key) => share::attach_key_to_share_url(&base_url, &key),
+                            None => base_url,
                         };
                         let _ = share::copy_to_clipboard(&share_url);
                         self.upload_state = UploadState::Complete {
@@ -1022,6 +1067,12 @@ impl App {
                             resumable: false,
                             cloud_security: Some(cloud_security),
                         };
+                        if response.reused {
+                            self.error_message = Some(
+                                "Reused existing cloud link for this unchanged session."
+                                    .to_string(),
+                            );
+                        }
                     }
                     Err(e) => {
                         self.upload_state = UploadState::Error {
@@ -1664,8 +1715,8 @@ impl App {
 
     /// Handle mouse events for text selection
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        // Only handle mouse in session viewer with content
-        if self.view != View::SessionViewer {
+        let modal_selectable = matches!(self.upload_state, UploadState::Complete { .. });
+        if !modal_selectable && self.view != View::SessionViewer {
             return;
         }
 
@@ -1742,14 +1793,13 @@ impl App {
     /// Extract selected text from `content_lines` based on current selection
     fn extract_selected_text(&self) -> Option<String> {
         let selection = self.text_selection.as_ref()?;
-        let ctx = self.current_context()?;
 
         if self.content_lines.is_empty() {
             return None;
         }
 
         let ((start_row, start_col), (end_row, end_col)) = selection.normalized();
-        let scroll = ctx.scroll_offset as usize;
+        let scroll = self.selection_scroll_offset as usize;
 
         let mut result = String::new();
 
@@ -1823,7 +1873,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_upload_modal(frame: &mut Frame, app: &App) {
+fn render_upload_modal(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Create centered modal area
@@ -1839,7 +1889,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
     // Clear background
     frame.render_widget(Clear, modal_area);
 
-    let (title, content, style) = match &app.upload_state {
+    let (title, content, style, selectable) = match &app.upload_state {
         UploadState::Idle => return,
         UploadState::Confirming {
             target,
@@ -1962,6 +2012,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                 " Share Session ",
                 content,
                 Style::default().fg(Color::Yellow),
+                false,
             )
         }
         UploadState::Compressing { target } => match target {
@@ -1969,11 +2020,13 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                 " Sharing... ",
                 "Preparing cloud payload...".to_string(),
                 Style::default().fg(Color::Cyan),
+                false,
             ),
             ShareTarget::File => (
                 " Exporting... ",
                 "Building share file...".to_string(),
                 Style::default().fg(Color::Cyan),
+                false,
             ),
         },
         UploadState::Uploading { target } => match target {
@@ -1981,11 +2034,13 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                 " Sharing... ",
                 "Uploading cloud payload...".to_string(),
                 Style::default().fg(Color::Cyan),
+                false,
             ),
             ShareTarget::File => (
                 " Exporting... ",
                 "Saving file...".to_string(),
                 Style::default().fg(Color::Cyan),
+                false,
             ),
         },
         UploadState::Complete {
@@ -2025,6 +2080,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                         share_import_command(location),
                     ),
                     Style::default().fg(Color::Green),
+                    true,
                 )
             }
             ShareTarget::File => (
@@ -2041,6 +2097,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                     share_import_command(location),
                 ),
                 Style::default().fg(Color::Green),
+                true,
             ),
         },
         UploadState::Error { message } => (
@@ -2050,10 +2107,34 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                 Press any key to close"
             ),
             Style::default().fg(Color::Red),
+            false,
         ),
     };
 
-    let modal = Paragraph::new(content)
+    let inner_area = Rect {
+        x: modal_area.x + 1,
+        y: modal_area.y + 1,
+        width: modal_area.width.saturating_sub(2),
+        height: modal_area.height.saturating_sub(2),
+    };
+
+    let content_lines: Vec<String> = content
+        .lines()
+        .map(std::string::ToString::to_string)
+        .collect();
+
+    let text = if selectable {
+        apply_selection_highlight(
+            Text::from(content.clone()),
+            app.text_selection.as_ref(),
+            0,
+            inner_area.width,
+        )
+    } else {
+        Text::from(content.clone())
+    };
+
+    let modal = Paragraph::new(text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2065,6 +2146,16 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::White));
 
     frame.render_widget(modal, modal_area);
+
+    if selectable {
+        app.content_area = Some(inner_area);
+        app.content_lines = content_lines;
+        app.selection_scroll_offset = 0;
+    } else {
+        app.content_area = None;
+        app.content_lines.clear();
+        app.selection_scroll_offset = 0;
+    }
 }
 
 fn render_resume_modal(frame: &mut Frame, app: &App) {
@@ -2414,6 +2505,7 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     if let Some(turn) = ctx.selected_turn() {
+        let scroll_offset = ctx.scroll_offset;
         let content: Text = match ctx.active_tab {
             DetailTab::Prompt => render_prompt_tab(turn),
             DetailTab::Thinking => render_thinking_tab(turn),
@@ -2451,6 +2543,7 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         // Store for mouse handling (after we're done with ctx borrow)
         app.content_area = Some(inner_content_area);
         app.content_lines = content_lines;
+        app.selection_scroll_offset = scroll_offset;
     } else {
         let paragraph = Paragraph::new("Select a turn to view details")
             .block(content_block)
@@ -2458,6 +2551,7 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(paragraph, content_area);
         app.content_area = None;
         app.content_lines.clear();
+        app.selection_scroll_offset = 0;
     }
 
     // Help line - show "Copied!" feedback briefly, otherwise show help
@@ -3199,7 +3293,9 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
 }
 
 fn usage_text(bin: &str) -> String {
-    format!("Usage:\n  {bin}\n  {bin} import <shared-session.json.zst | share-url>\n  {bin} --help")
+    format!(
+        "Usage:\n  {bin}\n  {bin} import <shared-session.json.zst | share-url>\n  {bin} login\n  {bin} uploads\n  {bin} --help"
+    )
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
@@ -3208,6 +3304,8 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
         [_] => Ok(CliCommand::Browse),
         [_, flag] if flag == "-h" || flag == "--help" => Ok(CliCommand::Help),
         [_, cmd, path] if cmd == "import" => Ok(CliCommand::Import(PathBuf::from(path))),
+        [_, cmd] if cmd == "login" => Ok(CliCommand::Login),
+        [_, cmd] if cmd == "uploads" => Ok(CliCommand::Uploads),
         _ => Err(eyre!("Invalid arguments.\n\n{}", usage_text(bin))),
     }
 }
@@ -3240,6 +3338,76 @@ fn share_import_command(path: &str) -> String {
     format!("vibereview import {}", shell_quote_arg(path))
 }
 
+fn require_cloud_api_url() -> Result<String> {
+    share::cloud_share_api_url().ok_or_else(|| {
+        eyre!(
+            "Cloud share is not configured. Set {}.",
+            share::SHARE_API_URL_ENV
+        )
+    })
+}
+
+fn resolve_github_client_id(api_url: &str) -> Result<String> {
+    if let Ok(client_id) = std::env::var(auth::GITHUB_CLIENT_ID_ENV) {
+        let client_id = client_id.trim().to_string();
+        if !client_id.is_empty() {
+            return Ok(client_id);
+        }
+    }
+    share::fetch_github_client_id(api_url)
+}
+
+fn run_login_command() -> Result<()> {
+    let api_url = require_cloud_api_url()?;
+    let client_id = resolve_github_client_id(&api_url)?;
+    let auth_state = auth::login_with_github(&client_id)?;
+    auth::save_auth_state(&auth_state)?;
+
+    println!(
+        "Logged in as @{} (GitHub ID {}).",
+        auth_state.github_login, auth_state.github_user_id
+    );
+    println!("Cloud uploads are now authorized for this account.");
+    Ok(())
+}
+
+fn run_uploads_command() -> Result<()> {
+    let api_url = require_cloud_api_url()?;
+    let token = auth::load_auth_token().ok_or_else(|| {
+        eyre!(
+            "Not logged in. Run `vibereview login` or set {}.",
+            auth::GITHUB_TOKEN_ENV
+        )
+    })?;
+
+    let uploads = share::list_uploads(&api_url, &token)?;
+    if uploads.uploads.is_empty() {
+        println!("No uploads found for your GitHub account.");
+        return Ok(());
+    }
+
+    for (idx, upload) in uploads.uploads.iter().enumerate() {
+        let name = upload.session_name.as_deref().unwrap_or("session");
+        let turns = upload
+            .turn_count
+            .map_or_else(|| "?".to_string(), |n| n.to_string());
+        let short_fingerprint = &upload.fingerprint[..12.min(upload.fingerprint.len())];
+        println!(
+            "{}. {} | id={} | turns={} | security={} | fp={} | at={} | {}",
+            idx + 1,
+            name,
+            upload.id,
+            turns,
+            upload.security,
+            short_fingerprint,
+            upload.uploaded_at,
+            upload.url
+        );
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -3249,15 +3417,26 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let command = parse_cli_command(&args)?;
-    if matches!(command, CliCommand::Help) {
-        let bin = args.first().map_or("vibereview", String::as_str);
-        println!("{}", usage_text(bin));
-        return Ok(());
+    match &command {
+        CliCommand::Help => {
+            let bin = args.first().map_or("vibereview", String::as_str);
+            println!("{}", usage_text(bin));
+            return Ok(());
+        }
+        CliCommand::Login => {
+            run_login_command()?;
+            return Ok(());
+        }
+        CliCommand::Uploads => {
+            run_uploads_command()?;
+            return Ok(());
+        }
+        CliCommand::Browse | CliCommand::Import(_) => {}
     }
 
     let imported_session = match command {
         CliCommand::Import(path) => Some(load_imported_session(&path)?),
-        CliCommand::Browse | CliCommand::Help => None,
+        CliCommand::Browse | CliCommand::Help | CliCommand::Login | CliCommand::Uploads => None,
     };
 
     enable_raw_mode()?;
@@ -3796,6 +3975,20 @@ mod tests {
             }
             _ => panic!("expected import command"),
         }
+    }
+
+    #[test]
+    fn test_parse_cli_command_login() {
+        let args = vec!["vibereview".to_string(), "login".to_string()];
+        let parsed = parse_cli_command(&args).unwrap();
+        assert!(matches!(parsed, CliCommand::Login));
+    }
+
+    #[test]
+    fn test_parse_cli_command_uploads() {
+        let args = vec!["vibereview".to_string(), "uploads".to_string()];
+        let parsed = parse_cli_command(&args).unwrap();
+        assert!(matches!(parsed, CliCommand::Uploads));
     }
 
     #[test]

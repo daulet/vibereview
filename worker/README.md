@@ -3,6 +3,7 @@
 Cloudflare Worker for session sharing. Handles upload, storage (R2), and web viewer.
 New shares are encrypted client-side by default (with optional public mode);
 the worker stores whatever payload the client uploads.
+Uploads and upload listing are authenticated via GitHub user identity.
 
 ## Setup
 
@@ -21,6 +22,16 @@ the worker stores whatever payload the client uploads.
    npm run deploy
    ```
 
+4. Configure vars:
+   - `GITHUB_CLIENT_ID`: OAuth app client ID used by CLI device flow login.
+   - `CORS_ORIGIN`: Allowed browser origin for frontend API calls.
+
+Example:
+
+```bash
+wrangler deploy --var GITHUB_CLIENT_ID=<your_client_id> --var CORS_ORIGIN=https://your-ui.example
+```
+
 ## Development
 
 ```bash
@@ -31,7 +42,9 @@ npm run dev
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/sessions` | POST | Upload payload (encrypted by default, public optional). Returns `{id, url}` |
+| `/api/auth/github/client-id` | GET | Returns configured GitHub OAuth client ID for CLI login |
+| `/api/sessions` | POST | Upload payload (encrypted by default, public optional). Requires `Authorization: Bearer <github_token>`. Returns `{id, url}` |
+| `/api/uploads` | GET | List uploads for authenticated GitHub user (`Authorization` required) |
 | `/api/sessions/:id` | GET | Get stored payload |
 | `/s/:id` | GET | Web viewer (for encrypted links include key fragment, e.g. `#k=...`) |
 

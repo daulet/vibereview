@@ -15,6 +15,7 @@ use color_eyre::Result;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -24,6 +25,8 @@ use std::path::{Path, PathBuf};
 /// Environment variable for the cloud share API endpoint.
 pub const SHARE_API_URL_ENV: &str = "VIBEREVIEW_SHARE_API_URL";
 pub const SHARE_KEY_PARAM: &str = "k";
+const GITHUB_CLIENT_ID_PATH: &str = "/api/auth/github/client-id";
+const LIST_UPLOADS_PATH: &str = "/api/uploads";
 const CLOUD_SHARE_KEY_LEN: usize = 32;
 const CLOUD_SHARE_NONCE_LEN: usize = 12;
 const CLOUD_SHARE_MAGIC: &[u8; 4] = b"VRE1";
@@ -128,6 +131,8 @@ pub struct UploadResponse {
     #[allow(dead_code)]
     pub id: String,
     pub url: String,
+    #[serde(default)]
+    pub reused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +140,22 @@ pub struct CloudShareLocator {
     pub id: String,
     pub api_url: String,
     pub key: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadListResponse {
+    pub uploads: Vec<UploadListItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadListItem {
+    pub id: String,
+    pub url: String,
+    pub fingerprint: String,
+    pub security: String,
+    pub session_name: Option<String>,
+    pub turn_count: Option<usize>,
+    pub uploaded_at: String,
 }
 
 /// Returns configured cloud share API URL if available.
@@ -147,6 +168,80 @@ pub fn cloud_share_api_url() -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn cloud_endpoint_url(api_url: &str, absolute_path: &str) -> Result<String> {
+    let base = reqwest::Url::parse(api_url)
+        .map_err(|e| color_eyre::eyre::eyre!("Invalid cloud API URL '{}': {e}", api_url))?;
+    let endpoint = base.join(absolute_path).map_err(|e| {
+        color_eyre::eyre::eyre!(
+            "Failed to build endpoint '{}' from '{}': {e}",
+            absolute_path,
+            api_url
+        )
+    })?;
+    Ok(endpoint.to_string())
+}
+
+pub fn fetch_github_client_id(api_url: &str) -> Result<String> {
+    let endpoint = cloud_endpoint_url(api_url, GITHUB_CLIENT_ID_PATH)?;
+    let client = reqwest::blocking::Client::new();
+    let response = client.get(endpoint).send()?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        return Err(color_eyre::eyre::eyre!(
+            "Failed to fetch GitHub client ID: {} - {}",
+            status,
+            body
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct ClientIdResponse {
+        client_id: String,
+    }
+
+    let parsed: ClientIdResponse = response.json()?;
+    let client_id = parsed.client_id.trim().to_string();
+    if client_id.is_empty() {
+        return Err(color_eyre::eyre::eyre!(
+            "Cloud auth endpoint returned an empty GitHub client ID"
+        ));
+    }
+    Ok(client_id)
+}
+
+pub fn list_uploads(api_url: &str, auth_token: &str) -> Result<UploadListResponse> {
+    let endpoint = cloud_endpoint_url(api_url, LIST_UPLOADS_PATH)?;
+    let client = reqwest::blocking::Client::new();
+    let response = client.get(endpoint).bearer_auth(auth_token).send()?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        return Err(color_eyre::eyre::eyre!(
+            "Failed to list uploads: {} - {}",
+            status,
+            body
+        ));
+    }
+
+    Ok(response.json()?)
+}
+
+pub fn session_fingerprint(session: &Session) -> Result<String> {
+    let data = serde_json::to_vec(&session.turns)?;
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    Ok(output)
 }
 
 #[must_use]
@@ -263,6 +358,20 @@ pub fn attach_key_to_share_url(url: &str, key: &[u8]) -> String {
             parsed.to_string()
         }
         Err(_) => format!("{url}#{SHARE_KEY_PARAM}={encoded_key}"),
+    }
+}
+
+#[must_use]
+pub fn normalize_share_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"');
+    let cleaned = trimmed
+        .replace("\\/", "/")
+        .replace("\\u0026", "&")
+        .replace("\\u0023", "#");
+
+    match reqwest::Url::parse(&cleaned) {
+        Ok(url) => url.to_string(),
+        Err(_) => cleaned,
     }
 }
 
@@ -670,12 +779,35 @@ fn sanitize_filename(name: &str) -> String {
 
 /// Upload a cloud share payload to the configured share service.
 /// Returns the upload response with ID and URL.
-pub fn upload_session(payload: &[u8], api_url: &str) -> Result<UploadResponse> {
+pub fn upload_session(
+    payload: &[u8],
+    api_url: &str,
+    auth_token: &str,
+    fingerprint: &str,
+    session_name: &str,
+    turn_count: usize,
+    security: &str,
+) -> Result<UploadResponse> {
     let client = reqwest::blocking::Client::new();
+    let safe_session_name: String = session_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii() && ch != '\n' && ch != '\r' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
 
     let response = client
         .post(api_url)
         .header("Content-Type", "application/octet-stream")
+        .bearer_auth(auth_token)
+        .header("X-Session-Fingerprint", fingerprint)
+        .header("X-Session-Name", safe_session_name)
+        .header("X-Session-Turn-Count", turn_count.to_string())
+        .header("X-Share-Security", security)
         .body(payload.to_vec())
         .send()?;
 
@@ -857,5 +989,83 @@ mod tests {
             "https://share.example/api/sessions/abc123DEF_45"
         );
         assert_eq!(locator.key.unwrap(), key.to_vec());
+    }
+
+    #[test]
+    fn test_normalize_share_url_unescapes_json_style_slashes() {
+        let raw = "https:\\/\\/share.example\\/s\\/abc123DEF_45";
+        let normalized = normalize_share_url(raw);
+        assert_eq!(normalized, "https://share.example/s/abc123DEF_45");
+    }
+
+    #[test]
+    fn test_normalize_share_url_strips_wrapping_quotes() {
+        let raw = "\"https://share.example/s/abc123DEF_45\"";
+        let normalized = normalize_share_url(raw);
+        assert_eq!(normalized, "https://share.example/s/abc123DEF_45");
+    }
+
+    #[test]
+    fn test_session_fingerprint_is_deterministic() {
+        let session = Session {
+            id: "s1".to_string(),
+            name: "Test".to_string(),
+            source: SessionSource::Other {
+                name: "x".to_string(),
+            },
+            project_path: None,
+            turns: vec![Turn {
+                id: "t1".to_string(),
+                timestamp: None,
+                user_prompt: "hello".to_string(),
+                thinking: None,
+                tool_invocations: Vec::new(),
+                response: "world".to_string(),
+                model: None,
+            }],
+        };
+
+        let first = session_fingerprint(&session).unwrap();
+        let second = session_fingerprint(&session).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+    }
+
+    #[test]
+    fn test_session_fingerprint_ignores_session_metadata() {
+        let turns = vec![Turn {
+            id: "t1".to_string(),
+            timestamp: None,
+            user_prompt: "hello".to_string(),
+            thinking: None,
+            tool_invocations: Vec::new(),
+            response: "world".to_string(),
+            model: None,
+        }];
+
+        let session_a = Session {
+            id: "a".to_string(),
+            name: "Session A".to_string(),
+            source: SessionSource::Other {
+                name: "x".to_string(),
+            },
+            project_path: None,
+            turns: turns.clone(),
+        };
+
+        let session_b = Session {
+            id: "b".to_string(),
+            name: "Session B".to_string(),
+            source: SessionSource::Other {
+                name: "y".to_string(),
+            },
+            project_path: None,
+            turns,
+        };
+
+        assert_eq!(
+            session_fingerprint(&session_a).unwrap(),
+            session_fingerprint(&session_b).unwrap()
+        );
     }
 }

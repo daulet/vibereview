@@ -8,3 +8,4 @@ bucket_name = "vibe-sessions"
 
 [vars]
 CORS_ORIGIN = "*"
+GITHUB_CLIENT_ID = ""
