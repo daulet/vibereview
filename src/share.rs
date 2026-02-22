@@ -1,10 +1,18 @@
 //! Session sharing functionality: export, compression, upload, and clipboard operations.
 
 use crate::models::{Session, ToolInvocation, ToolType, Turn};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use arboard::Clipboard;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::Utc;
 use color_eyre::Result;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -15,6 +23,10 @@ use std::path::{Path, PathBuf};
 
 /// Environment variable for the cloud share API endpoint.
 pub const SHARE_API_URL_ENV: &str = "VIBEREVIEW_SHARE_API_URL";
+pub const SHARE_KEY_PARAM: &str = "k";
+const CLOUD_SHARE_KEY_LEN: usize = 32;
+const CLOUD_SHARE_NONCE_LEN: usize = 12;
+const CLOUD_SHARE_MAGIC: &[u8; 4] = b"VRE1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +130,13 @@ pub struct UploadResponse {
     pub url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CloudShareLocator {
+    pub id: String,
+    pub api_url: String,
+    pub key: Option<Vec<u8>>,
+}
+
 /// Returns configured cloud share API URL if available.
 #[must_use]
 pub fn cloud_share_api_url() -> Option<String> {
@@ -128,6 +147,233 @@ pub fn cloud_share_api_url() -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+#[must_use]
+pub fn generate_cloud_share_key() -> [u8; CLOUD_SHARE_KEY_LEN] {
+    let mut key = [0_u8; CLOUD_SHARE_KEY_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    key
+}
+
+#[must_use]
+pub fn encode_cloud_share_key(key: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(key)
+}
+
+pub fn decode_cloud_share_key(encoded: &str) -> Result<Vec<u8>> {
+    let decoded = URL_SAFE_NO_PAD.decode(encoded.trim())?;
+    if decoded.len() != CLOUD_SHARE_KEY_LEN {
+        return Err(color_eyre::eyre::eyre!(
+            "Invalid share key length: expected {} bytes, got {}",
+            CLOUD_SHARE_KEY_LEN,
+            decoded.len()
+        ));
+    }
+    Ok(decoded)
+}
+
+#[must_use]
+pub fn is_encrypted_cloud_payload(payload: &[u8]) -> bool {
+    payload.starts_with(CLOUD_SHARE_MAGIC)
+}
+
+pub fn encrypt_cloud_payload(compressed: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    if key.len() != CLOUD_SHARE_KEY_LEN {
+        return Err(color_eyre::eyre::eyre!(
+            "Invalid share key length: expected {} bytes, got {}",
+            CLOUD_SHARE_KEY_LEN,
+            key.len()
+        ));
+    }
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to initialize cloud share cipher: {e}"))?;
+
+    let mut nonce = [0_u8; CLOUD_SHARE_NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), compressed)
+        .map_err(|_| color_eyre::eyre::eyre!("Failed to encrypt cloud share payload"))?;
+
+    let mut output = Vec::with_capacity(CLOUD_SHARE_MAGIC.len() + nonce.len() + ciphertext.len());
+    output.extend_from_slice(CLOUD_SHARE_MAGIC);
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
+}
+
+pub fn decrypt_cloud_payload(payload: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    if key.len() != CLOUD_SHARE_KEY_LEN {
+        return Err(color_eyre::eyre::eyre!(
+            "Invalid share key length: expected {} bytes, got {}",
+            CLOUD_SHARE_KEY_LEN,
+            key.len()
+        ));
+    }
+
+    if !is_encrypted_cloud_payload(payload) {
+        return Err(color_eyre::eyre::eyre!(
+            "Payload is not an encrypted cloud share"
+        ));
+    }
+
+    let min_len = CLOUD_SHARE_MAGIC.len() + CLOUD_SHARE_NONCE_LEN + 16;
+    if payload.len() < min_len {
+        return Err(color_eyre::eyre::eyre!(
+            "Encrypted payload is too short or corrupted"
+        ));
+    }
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to initialize cloud share cipher: {e}"))?;
+    let nonce_start = CLOUD_SHARE_MAGIC.len();
+    let nonce_end = nonce_start + CLOUD_SHARE_NONCE_LEN;
+    let nonce = Nonce::from_slice(&payload[nonce_start..nonce_end]);
+    let ciphertext = &payload[nonce_end..];
+
+    cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        color_eyre::eyre::eyre!(
+            "Failed to decrypt cloud share payload. Ensure the link key is correct."
+        )
+    })
+}
+
+pub fn decode_cloud_payload(payload: &[u8], key: Option<&[u8]>) -> Result<Vec<u8>> {
+    if is_encrypted_cloud_payload(payload) {
+        let key = key.ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "This shared session is encrypted. Add '#{}=<key>' to the link.",
+                SHARE_KEY_PARAM
+            )
+        })?;
+        decrypt_cloud_payload(payload, key)
+    } else {
+        Ok(payload.to_vec())
+    }
+}
+
+#[must_use]
+pub fn attach_key_to_share_url(url: &str, key: &[u8]) -> String {
+    let encoded_key = encode_cloud_share_key(key);
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            parsed.set_fragment(Some(&format!("{SHARE_KEY_PARAM}={encoded_key}")));
+            parsed.to_string()
+        }
+        Err(_) => format!("{url}#{SHARE_KEY_PARAM}={encoded_key}"),
+    }
+}
+
+pub fn parse_cloud_share_locator(input: &str) -> Result<CloudShareLocator> {
+    let parsed = reqwest::Url::parse(input.trim())
+        .map_err(|e| color_eyre::eyre::eyre!("Invalid URL: {e}"))?;
+
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(color_eyre::eyre::eyre!(
+            "Unsupported URL scheme '{}'. Expected http or https.",
+            parsed.scheme()
+        ));
+    }
+
+    let path = parsed.path().trim_end_matches('/');
+    let id = path
+        .strip_prefix("/s/")
+        .or_else(|| path.strip_prefix("/api/sessions/"))
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "Unsupported share URL path '{}'. Expected '/s/<id>' or '/api/sessions/<id>'.",
+                parsed.path()
+            )
+        })?;
+
+    if !is_valid_cloud_share_id(id) {
+        return Err(color_eyre::eyre::eyre!("Invalid cloud share ID: '{id}'"));
+    }
+
+    let mut key_encoded = parsed.query_pairs().find_map(|(k, v)| {
+        if k == SHARE_KEY_PARAM || k == "key" {
+            Some(v.into_owned())
+        } else {
+            None
+        }
+    });
+
+    if key_encoded.is_none() {
+        key_encoded = parsed.fragment().and_then(parse_key_from_fragment);
+    }
+
+    let key = key_encoded
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(decode_cloud_share_key)
+        .transpose()?;
+
+    let api_url = parsed
+        .join(&format!("/api/sessions/{id}"))
+        .map_err(|e| color_eyre::eyre::eyre!("Failed to build API URL from share link: {e}"))?
+        .to_string();
+
+    Ok(CloudShareLocator {
+        id: id.to_string(),
+        api_url,
+        key,
+    })
+}
+
+pub fn fetch_shared_session_from_cloud_link(link: &str) -> Result<SharedSession> {
+    let locator = parse_cloud_share_locator(link)?;
+    let payload = download_cloud_payload(&locator.api_url)?;
+    let compressed = decode_cloud_payload(&payload, locator.key.as_deref())?;
+    decompress_session(&compressed)
+}
+
+fn is_valid_cloud_share_id(id: &str) -> bool {
+    id.len() == 12
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn parse_key_from_fragment(fragment: &str) -> Option<String> {
+    if fragment.is_empty() {
+        return None;
+    }
+
+    if !fragment.contains('=') {
+        return Some(fragment.to_string());
+    }
+
+    for pair in fragment.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if name == SHARE_KEY_PARAM || name == "key" {
+            if let Some(value) = parts.next() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn download_cloud_payload(api_url: &str) -> Result<Vec<u8>> {
+    let client = reqwest::blocking::Client::new();
+    let response = client.get(api_url).send()?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        return Err(color_eyre::eyre::eyre!(
+            "Download failed: {} - {}",
+            status,
+            body
+        ));
+    }
+
+    Ok(response.bytes()?.to_vec())
 }
 
 /// Compress a session using zstd level 3.
@@ -420,16 +666,15 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Upload a compressed session to the configured share service.
+/// Upload a cloud share payload to the configured share service.
 /// Returns the upload response with ID and URL.
-pub fn upload_session(compressed: &[u8], api_url: &str) -> Result<UploadResponse> {
+pub fn upload_session(payload: &[u8], api_url: &str) -> Result<UploadResponse> {
     let client = reqwest::blocking::Client::new();
 
     let response = client
         .post(api_url)
         .header("Content-Type", "application/octet-stream")
-        .header("Content-Encoding", "zstd")
-        .body(compressed.to_vec())
+        .body(payload.to_vec())
         .send()?;
 
     if !response.status().is_success() {
@@ -568,5 +813,47 @@ mod tests {
         let only = &parsed.session.turns[0].tool_invocations[0];
         assert!(matches!(only.tool_type, ToolType::FileEdit { .. }));
         assert_eq!(only.input_display, "[redacted]");
+    }
+
+    #[test]
+    fn test_cloud_share_key_roundtrip() {
+        let key = [7_u8; 32];
+        let encoded = encode_cloud_share_key(&key);
+        let decoded = decode_cloud_share_key(&encoded).unwrap();
+        assert_eq!(decoded, key.to_vec());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_cloud_payload_roundtrip() {
+        let key = [9_u8; 32];
+        let payload = b"hello encrypted world";
+        let encrypted = encrypt_cloud_payload(payload, &key).unwrap();
+        assert!(is_encrypted_cloud_payload(&encrypted));
+
+        let decrypted = decrypt_cloud_payload(&encrypted, &key).unwrap();
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn test_decode_encrypted_payload_without_key_fails() {
+        let key = [5_u8; 32];
+        let payload = b"hello";
+        let encrypted = encrypt_cloud_payload(payload, &key).unwrap();
+        assert!(decode_cloud_payload(&encrypted, None).is_err());
+    }
+
+    #[test]
+    fn test_parse_cloud_share_locator_extracts_key() {
+        let key = [3_u8; 32];
+        let encoded = encode_cloud_share_key(&key);
+        let url = format!("https://share.example/s/abc123DEF_45#k={encoded}");
+
+        let locator = parse_cloud_share_locator(&url).unwrap();
+        assert_eq!(locator.id, "abc123DEF_45");
+        assert_eq!(
+            locator.api_url,
+            "https://share.example/api/sessions/abc123DEF_45"
+        );
+        assert_eq!(locator.key.unwrap(), key.to_vec());
     }
 }

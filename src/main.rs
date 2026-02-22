@@ -813,14 +813,26 @@ impl App {
                     }
                 };
 
+                let key = share::generate_cloud_share_key();
+                let payload = match share::encrypt_cloud_payload(&compressed, &key) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.upload_state = UploadState::Error {
+                            message: format!("Encryption failed: {e}"),
+                        };
+                        return;
+                    }
+                };
+
                 self.upload_state = UploadState::Uploading { target };
 
-                match share::upload_session(&compressed, api_url) {
+                match share::upload_session(&payload, api_url) {
                     Ok(response) => {
-                        let _ = share::copy_to_clipboard(&response.url);
+                        let share_url = share::attach_key_to_share_url(&response.url, &key);
+                        let _ = share::copy_to_clipboard(&share_url);
                         self.upload_state = UploadState::Complete {
                             target,
-                            location: response.url,
+                            location: share_url,
                             resumable: false,
                         };
                     }
@@ -1657,10 +1669,14 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                           c) Cloud link\n\
                           f) File export\n\n\
                         Selected destination: {}\n\n\
+                        Cloud link uploads an encrypted payload.\n\
+                        Decryption key is appended as '#{}=...'.\n\
+                        Anyone with full URL can view/import.\n\n\
                         Press Enter or 'y' to upload full session,\n\
                         Esc or 'n' to cancel",
                         truncate_str(&session_name, 36),
                         target.label(),
+                        share::SHARE_KEY_PARAM,
                     )
                 } else {
                     let resumable_hint = if mode.is_resumable() {
@@ -1720,7 +1736,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
         UploadState::Compressing { target } => match target {
             ShareTarget::Cloud => (
                 " Sharing... ",
-                "Compressing session...".to_string(),
+                "Compressing and encrypting session...".to_string(),
                 Style::default().fg(Color::Cyan),
             ),
             ShareTarget::File => (
@@ -1732,7 +1748,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
         UploadState::Uploading { target } => match target {
             ShareTarget::Cloud => (
                 " Sharing... ",
-                "Uploading to cloud...".to_string(),
+                "Uploading encrypted payload...".to_string(),
                 Style::default().fg(Color::Cyan),
             ),
             ShareTarget::File => (
@@ -1751,8 +1767,14 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                 format!(
                     "Session shared successfully!\n\n\
                     URL: {location}\n\n\
+                    Includes decryption key in '#{}=...'.\n\
+                    Keep the full URL when sharing.\n\
                     (Copied to clipboard)\n\n\
-                    Press any key to close"
+                    To open locally via CLI:\n\
+                    {}\n\n\
+                    Press any key to close",
+                    share::SHARE_KEY_PARAM,
+                    share_import_command(location),
                 ),
                 Style::default().fg(Color::Green),
             ),
@@ -2928,7 +2950,7 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
 }
 
 fn usage_text(bin: &str) -> String {
-    format!("Usage:\n  {bin}\n  {bin} import <shared-session.json.zst>\n  {bin} --help")
+    format!("Usage:\n  {bin}\n  {bin} import <shared-session.json.zst | share-url>\n  {bin} --help")
 }
 
 fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
@@ -2942,9 +2964,23 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
 }
 
 fn load_imported_session(path: &Path) -> Result<Session> {
-    let shared = share::read_share_file_from_path(path)
-        .map_err(|e| eyre!("Failed to read shared file {}: {e}", path.display()))?;
-    Ok(shared.session)
+    if path.exists() {
+        let shared = share::read_share_file_from_path(path)
+            .map_err(|e| eyre!("Failed to read shared file {}: {e}", path.display()))?;
+        return Ok(shared.session);
+    }
+
+    let input = path.to_string_lossy();
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let shared = share::fetch_shared_session_from_cloud_link(&input)
+            .map_err(|e| eyre!("Failed to import from share URL: {e}"))?;
+        return Ok(shared.session);
+    }
+
+    Err(eyre!(
+        "Import source not found: {} (expected local file or share URL)",
+        path.display()
+    ))
 }
 
 fn shell_quote_arg(arg: &str) -> String {
@@ -3500,6 +3536,15 @@ mod tests {
     fn test_share_import_command_quotes_path() {
         let cmd = share_import_command("/tmp/session file.json.zst");
         assert_eq!(cmd, "vibereview import \"/tmp/session file.json.zst\"");
+    }
+
+    #[test]
+    fn test_share_import_command_quotes_url_with_fragment() {
+        let cmd = share_import_command("https://share.example/s/abc123DEF_45#k=secret");
+        assert_eq!(
+            cmd,
+            "vibereview import \"https://share.example/s/abc123DEF_45#k=secret\""
+        );
     }
 
     #[test]

@@ -116,7 +116,6 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   await env.SESSIONS.put(id, body, {
     httpMetadata: {
       contentType: 'application/octet-stream',
-      contentEncoding: 'zstd',
     },
     customMetadata: {
       uploadedAt: new Date().toISOString(),
@@ -658,6 +657,8 @@ function generateViewerHtml(sessionId: string): string {
 
     const SESSION_ID = '${sessionId}';
     const API_URL = '/api/sessions/' + SESSION_ID;
+    const CLOUD_SHARE_MAGIC = [0x56, 0x52, 0x45, 0x31]; // "VRE1"
+    const NONCE_LEN = 12;
 
     let session = null;
     let turns = [];
@@ -666,6 +667,70 @@ function generateViewerHtml(sessionId: string): string {
     let selectedToolIndex = 0;
     let activeTab = 'prompt';
 
+    function getShareKeyFromLocation() {
+      const queryParams = new URLSearchParams(window.location.search);
+      const queryKey = queryParams.get('k') || queryParams.get('key');
+      if (queryKey) {
+        return queryKey;
+      }
+
+      const fragment = window.location.hash.startsWith('#')
+        ? window.location.hash.slice(1)
+        : window.location.hash;
+      if (!fragment) {
+        return null;
+      }
+
+      if (!fragment.includes('=')) {
+        return fragment;
+      }
+
+      const fragmentParams = new URLSearchParams(fragment);
+      return fragmentParams.get('k') || fragmentParams.get('key');
+    }
+
+    function base64UrlToBytes(value) {
+      let base64 = value.replace(/-/g, '+').replace(/_/g, '/');
+      while (base64.length % 4 !== 0) {
+        base64 += '=';
+      }
+      const raw = atob(base64);
+      const bytes = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) {
+        bytes[i] = raw.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function isEncryptedPayload(payload) {
+      if (payload.length < CLOUD_SHARE_MAGIC.length + NONCE_LEN + 16) {
+        return false;
+      }
+      return CLOUD_SHARE_MAGIC.every((byte, i) => payload[i] === byte);
+    }
+
+    async function decryptPayload(payload, keyBytes) {
+      const nonceStart = CLOUD_SHARE_MAGIC.length;
+      const nonceEnd = nonceStart + NONCE_LEN;
+      const nonce = payload.slice(nonceStart, nonceEnd);
+      const ciphertext = payload.slice(nonceEnd);
+
+      const key = await crypto.subtle.importKey(
+        'raw',
+        keyBytes,
+        { name: 'AES-GCM' },
+        false,
+        ['decrypt']
+      );
+
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: nonce },
+        key,
+        ciphertext
+      );
+      return new Uint8Array(decrypted);
+    }
+
     async function loadSession() {
       try {
         const response = await fetch(API_URL);
@@ -673,8 +738,28 @@ function generateViewerHtml(sessionId: string): string {
           throw new Error('Session not found');
         }
 
-        const compressed = await response.arrayBuffer();
-        const decompressed = decompress(new Uint8Array(compressed));
+        const payload = new Uint8Array(await response.arrayBuffer());
+        let compressed = payload;
+
+        if (isEncryptedPayload(payload)) {
+          const encodedKey = getShareKeyFromLocation();
+          if (!encodedKey) {
+            throw new Error("Missing share key. Add '#k=<key>' to the URL.");
+          }
+
+          const keyBytes = base64UrlToBytes(encodedKey);
+          if (keyBytes.length !== 32) {
+            throw new Error('Invalid share key');
+          }
+
+          try {
+            compressed = await decryptPayload(payload, keyBytes);
+          } catch {
+            throw new Error('Failed to decrypt payload. Check the share key in the URL.');
+          }
+        }
+
+        const decompressed = decompress(compressed);
         const text = new TextDecoder().decode(decompressed);
         const data = JSON.parse(text);
 
