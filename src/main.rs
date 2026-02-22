@@ -2218,23 +2218,33 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
         height: modal_area.height.saturating_sub(2),
     };
 
-    let content_lines: Vec<String> = content
-        .lines()
-        .map(std::string::ToString::to_string)
-        .collect();
+    let content_lines: Vec<String> = if selectable {
+        wrap_text_for_selection(&content, inner_area.width)
+    } else {
+        content
+            .lines()
+            .map(std::string::ToString::to_string)
+            .collect()
+    };
+
+    let render_text = if selectable {
+        content_lines.join("\n")
+    } else {
+        content.clone()
+    };
 
     let text = if selectable {
         apply_selection_highlight(
-            Text::from(content.clone()),
+            Text::from(render_text.clone()),
             app.text_selection.as_ref(),
             0,
             inner_area.width,
         )
     } else {
-        Text::from(content.clone())
+        Text::from(render_text)
     };
 
-    let modal = Paragraph::new(text)
+    let mut modal = Paragraph::new(text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2242,8 +2252,10 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
                 .title(title)
                 .title_style(style.add_modifier(Modifier::BOLD)),
         )
-        .wrap(Wrap { trim: false })
         .style(Style::default().fg(Color::White));
+    if !selectable {
+        modal = modal.wrap(Wrap { trim: false });
+    }
 
     frame.render_widget(modal, modal_area);
 
@@ -2256,6 +2268,42 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
         app.content_lines.clear();
         app.selection_scroll_offset = 0;
     }
+}
+
+fn wrap_text_for_selection(text: &str, width: u16) -> Vec<String> {
+    let max_cols = usize::from(width.max(1));
+    let mut wrapped = Vec::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut chunk = String::new();
+        let mut col = 0_usize;
+        for ch in line.chars() {
+            chunk.push(ch);
+            col += 1;
+            if col >= max_cols {
+                wrapped.push(std::mem::take(&mut chunk));
+                col = 0;
+            }
+        }
+
+        if !chunk.is_empty() {
+            wrapped.push(chunk);
+        }
+    }
+
+    if text.ends_with('\n') {
+        wrapped.push(String::new());
+    }
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
 }
 
 fn render_resume_modal(frame: &mut Frame, app: &App) {
@@ -4213,6 +4261,18 @@ mod tests {
             cmd,
             "vibereview import \"https://share.example/s/abc123DEF_45#k=secret\""
         );
+    }
+
+    #[test]
+    fn test_wrap_text_for_selection_wraps_lines() {
+        let wrapped = wrap_text_for_selection("abcdefgh", 4);
+        assert_eq!(wrapped, vec!["abcd", "efgh"]);
+    }
+
+    #[test]
+    fn test_wrap_text_for_selection_preserves_empty_lines() {
+        let wrapped = wrap_text_for_selection("ab\n\ncd", 8);
+        assert_eq!(wrapped, vec!["ab", "", "cd"]);
     }
 
     #[test]
