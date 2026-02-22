@@ -978,10 +978,7 @@ impl App {
             ShareTarget::Cloud => {
                 let Some(api_url) = cloud_api_url else {
                     self.upload_state = UploadState::Error {
-                        message: format!(
-                            "Cloud share is not configured. Set {}.",
-                            share::SHARE_API_URL_ENV
-                        ),
+                        message: "Cloud share endpoint is unavailable.".to_string(),
                     };
                     return;
                 };
@@ -1894,7 +1891,7 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
         UploadState::Confirming {
             target,
             mode,
-            cloud_api_url,
+            cloud_api_url: _cloud_api_url,
             cloud_security,
             focus,
         } => {
@@ -1917,70 +1914,39 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
                 }
             };
             let radio = |selected: bool| if selected { "[x]" } else { "[ ]" };
-            let content = if cloud_api_url.is_some() {
-                if *target == ShareTarget::Cloud {
-                    let key_note = match cloud_security {
-                        CloudShareSecurity::Encrypted => format!(
-                            "Encrypted link uploads ciphertext.\n\
-                            Key is appended as '#{}=...'.\n\
-                            Share full URL for access.",
-                            share::SHARE_KEY_PARAM
-                        ),
-                        CloudShareSecurity::Public => "Public link uploads readable payload.\n\
-                            No key required to view/import."
-                            .to_string(),
-                    };
-                    format!(
-                        "Share \"{}\".\n\n\
-                        {} Destination:\n\
-                          {} Cloud link\n\
-                          {} File export\n\n\
-                        {} Security:\n\
-                          {} Encrypted (recommended)\n\
-                          {} Public (not encrypted)\n\n\
-                        {}\n\n\
-                        Tab/Shift+Tab: next/prev section\n\
-                        Arrows: change selected radio\n\
-                        Enter or 'y': share | Esc or 'n': cancel",
-                        truncate_str(&session_name, 36),
-                        section_marker(ShareDialogSection::Destination),
-                        radio(*target == ShareTarget::Cloud),
-                        radio(*target == ShareTarget::File),
-                        section_marker(ShareDialogSection::CloudSecurity),
-                        radio(*cloud_security == CloudShareSecurity::Encrypted),
-                        radio(*cloud_security == CloudShareSecurity::Public),
-                        key_note,
-                    )
-                } else {
-                    let resumable_hint = if mode.is_resumable() {
-                        "Yes (includes resume artifacts)"
-                    } else {
-                        "No (redacted export)"
-                    };
-                    format!(
-                        "Share \"{}\".\n\n\
-                        {} Destination:\n\
-                          {} Cloud link\n\
-                          {} File export\n\n\
-                        {} Export mode:\n\
-                          {} Prompt + response only\n\
-                          {} Prompt + response + diff\n\
-                          {} Full session (resumable)\n\n\
-                        Resumable on another machine: {}\n\n\
-                        Tab/Shift+Tab: next/prev section\n\
-                        Arrows: change selected radio\n\
-                        Enter or 'y': export | Esc or 'n': cancel",
-                        truncate_str(&session_name, 36),
-                        section_marker(ShareDialogSection::Destination),
-                        radio(*target == ShareTarget::Cloud),
-                        radio(*target == ShareTarget::File),
-                        section_marker(ShareDialogSection::ExportMode),
-                        radio(*mode == share::ShareExportMode::PromptResponseOnly),
-                        radio(*mode == share::ShareExportMode::PromptResponseAndDiff),
-                        radio(*mode == share::ShareExportMode::FullSession),
-                        resumable_hint
-                    )
-                }
+            let content = if *target == ShareTarget::Cloud {
+                let key_note = match cloud_security {
+                    CloudShareSecurity::Encrypted => format!(
+                        "Encrypted link uploads ciphertext.\n\
+                        Key is appended as '#{}=...'.\n\
+                        Share full URL for access.",
+                        share::SHARE_KEY_PARAM
+                    ),
+                    CloudShareSecurity::Public => "Public link uploads readable payload.\n\
+                        No key required to view/import."
+                        .to_string(),
+                };
+                format!(
+                    "Share \"{}\".\n\n\
+                    {} Destination:\n\
+                      {} Cloud link\n\
+                      {} File export\n\n\
+                    {} Security:\n\
+                      {} Encrypted (recommended)\n\
+                      {} Public (not encrypted)\n\n\
+                    {}\n\n\
+                    Tab/Shift+Tab: next/prev section\n\
+                    Arrows: change selected radio\n\
+                    Enter or 'y': share | Esc or 'n': cancel",
+                    truncate_str(&session_name, 36),
+                    section_marker(ShareDialogSection::Destination),
+                    radio(*target == ShareTarget::Cloud),
+                    radio(*target == ShareTarget::File),
+                    section_marker(ShareDialogSection::CloudSecurity),
+                    radio(*cloud_security == CloudShareSecurity::Encrypted),
+                    radio(*cloud_security == CloudShareSecurity::Public),
+                    key_note,
+                )
             } else {
                 let resumable_hint = if mode.is_resumable() {
                     "Yes (includes resume artifacts)"
@@ -1989,18 +1955,21 @@ fn render_upload_modal(frame: &mut Frame, app: &mut App) {
                 };
                 format!(
                     "Share \"{}\".\n\n\
-                    Cloud share is not configured.\n\
-                    Set {} to enable cloud links.\n\
-                    Falling back to file export.\n\n\
+                    {} Destination:\n\
+                      {} Cloud link\n\
+                      {} File export\n\n\
                     {} Export mode:\n\
                       {} Prompt + response only\n\
                       {} Prompt + response + diff\n\
                       {} Full session (resumable)\n\n\
                     Resumable on another machine: {}\n\n\
+                    Tab/Shift+Tab: next/prev section\n\
                     Arrows: change selected radio\n\
                     Enter or 'y': export | Esc or 'n': cancel",
                     truncate_str(&session_name, 36),
-                    share::SHARE_API_URL_ENV,
+                    section_marker(ShareDialogSection::Destination),
+                    radio(*target == ShareTarget::Cloud),
+                    radio(*target == ShareTarget::File),
                     section_marker(ShareDialogSection::ExportMode),
                     radio(*mode == share::ShareExportMode::PromptResponseOnly),
                     radio(*mode == share::ShareExportMode::PromptResponseAndDiff),
@@ -3338,28 +3307,18 @@ fn share_import_command(path: &str) -> String {
     format!("vibereview import {}", shell_quote_arg(path))
 }
 
-fn require_cloud_api_url() -> Result<String> {
-    share::cloud_share_api_url().ok_or_else(|| {
-        eyre!(
-            "Cloud share is not configured. Set {}.",
-            share::SHARE_API_URL_ENV
-        )
-    })
-}
-
-fn resolve_github_client_id(api_url: &str) -> Result<String> {
+fn resolve_github_client_id() -> Result<String> {
     if let Ok(client_id) = std::env::var(auth::GITHUB_CLIENT_ID_ENV) {
         let client_id = client_id.trim().to_string();
         if !client_id.is_empty() {
             return Ok(client_id);
         }
     }
-    share::fetch_github_client_id(api_url)
+    share::fetch_github_client_id()
 }
 
 fn run_login_command() -> Result<()> {
-    let api_url = require_cloud_api_url()?;
-    let client_id = resolve_github_client_id(&api_url)?;
+    let client_id = resolve_github_client_id()?;
     let auth_state = auth::login_with_github(&client_id)?;
     auth::save_auth_state(&auth_state)?;
 
@@ -3372,7 +3331,6 @@ fn run_login_command() -> Result<()> {
 }
 
 fn run_uploads_command() -> Result<()> {
-    let api_url = require_cloud_api_url()?;
     let token = auth::load_auth_token().ok_or_else(|| {
         eyre!(
             "Not logged in. Run `vibereview login` or set {}.",
@@ -3380,7 +3338,7 @@ fn run_uploads_command() -> Result<()> {
         )
     })?;
 
-    let uploads = share::list_uploads(&api_url, &token)?;
+    let uploads = share::list_uploads(&token)?;
     if uploads.uploads.is_empty() {
         println!("No uploads found for your GitHub account.");
         return Ok(());

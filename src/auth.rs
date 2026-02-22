@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub const GITHUB_CLIENT_ID_ENV: &str = "VIBEREVIEW_GITHUB_CLIENT_ID";
 pub const GITHUB_TOKEN_ENV: &str = "VIBEREVIEW_GITHUB_TOKEN";
+pub const GITHUB_CLIENT_ID_ENV: &str = "VIBEREVIEW_GITHUB_CLIENT_ID";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthState {

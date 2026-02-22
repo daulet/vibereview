@@ -17,14 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Environment variable for the cloud share API endpoint.
-pub const SHARE_API_URL_ENV: &str = "VIBEREVIEW_SHARE_API_URL";
 pub const SHARE_KEY_PARAM: &str = "k";
+
+pub const CLOUD_SHARE_API_URL: &str = "https://vibereview.trustme.workers.dev/api/sessions";
 const GITHUB_CLIENT_ID_PATH: &str = "/api/auth/github/client-id";
 const LIST_UPLOADS_PATH: &str = "/api/uploads";
 const CLOUD_SHARE_KEY_LEN: usize = 32;
@@ -161,30 +160,25 @@ pub struct UploadListItem {
 /// Returns configured cloud share API URL if available.
 #[must_use]
 pub fn cloud_share_api_url() -> Option<String> {
-    let value = env::var(SHARE_API_URL_ENV).ok()?;
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    Some(CLOUD_SHARE_API_URL.to_string())
 }
 
-fn cloud_endpoint_url(api_url: &str, absolute_path: &str) -> Result<String> {
-    let base = reqwest::Url::parse(api_url)
-        .map_err(|e| color_eyre::eyre::eyre!("Invalid cloud API URL '{}': {e}", api_url))?;
+fn cloud_endpoint_url(absolute_path: &str) -> Result<String> {
+    let base = reqwest::Url::parse(CLOUD_SHARE_API_URL).map_err(|e| {
+        color_eyre::eyre::eyre!("Invalid hardcoded cloud API URL '{}': {e}", CLOUD_SHARE_API_URL)
+    })?;
     let endpoint = base.join(absolute_path).map_err(|e| {
         color_eyre::eyre::eyre!(
-            "Failed to build endpoint '{}' from '{}': {e}",
+            "Failed to build endpoint '{}' from hardcoded cloud API URL '{}': {e}",
             absolute_path,
-            api_url
+            CLOUD_SHARE_API_URL
         )
     })?;
     Ok(endpoint.to_string())
 }
 
-pub fn fetch_github_client_id(api_url: &str) -> Result<String> {
-    let endpoint = cloud_endpoint_url(api_url, GITHUB_CLIENT_ID_PATH)?;
+pub fn fetch_github_client_id() -> Result<String> {
+    let endpoint = cloud_endpoint_url(GITHUB_CLIENT_ID_PATH)?;
     let client = reqwest::blocking::Client::new();
     let response = client.get(endpoint).send()?;
 
@@ -213,8 +207,8 @@ pub fn fetch_github_client_id(api_url: &str) -> Result<String> {
     Ok(client_id)
 }
 
-pub fn list_uploads(api_url: &str, auth_token: &str) -> Result<UploadListResponse> {
-    let endpoint = cloud_endpoint_url(api_url, LIST_UPLOADS_PATH)?;
+pub fn list_uploads(auth_token: &str) -> Result<UploadListResponse> {
+    let endpoint = cloud_endpoint_url(LIST_UPLOADS_PATH)?;
     let client = reqwest::blocking::Client::new();
     let response = client.get(endpoint).bearer_auth(auth_token).send()?;
 

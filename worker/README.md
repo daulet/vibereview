@@ -24,12 +24,12 @@ Uploads and upload listing are authenticated via GitHub user identity.
 
 4. Configure vars:
    - `GITHUB_CLIENT_ID`: OAuth app client ID used by CLI device flow login.
-   - `CORS_ORIGIN`: Allowed browser origin for frontend API calls.
+   - Allowed browser origin (CORS) is hardcoded to `https://vibereview.trustme.workers.dev`.
 
 Example:
 
 ```bash
-wrangler deploy --var GITHUB_CLIENT_ID=<your_client_id> --var CORS_ORIGIN=https://your-ui.example
+wrangler deploy --var GITHUB_CLIENT_ID=<your_client_id>
 ```
 
 ## Development
@@ -42,7 +42,7 @@ npm run dev
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/auth/github/client-id` | GET | Returns configured GitHub OAuth client ID for CLI login |
+| `/api/auth/github/client-id` | GET | Returns configured GitHub OAuth client ID |
 | `/api/sessions` | POST | Upload payload (encrypted by default, public optional). Requires `Authorization: Bearer <github_token>`. Returns `{id, url}` |
 | `/api/uploads` | GET | List uploads for authenticated GitHub user (`Authorization` required) |
 | `/api/sessions/:id` | GET | Get stored payload |

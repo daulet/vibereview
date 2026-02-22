@@ -2,9 +2,10 @@ import { nanoid } from 'nanoid';
 
 export interface Env {
   SESSIONS: R2Bucket;
-  CORS_ORIGIN: string;
   GITHUB_CLIENT_ID: string;
 }
+
+const CORS_ALLOWED_ORIGIN = 'https://vibereview.trustme.workers.dev';
 
 // Rate limiting: Track uploads per IP (in-memory, resets on worker restart)
 const uploadCounts = new Map<string, { count: number; resetAt: number }>();
@@ -49,9 +50,9 @@ function checkRateLimit(ip: string): boolean {
   return true;
 }
 
-function corsHeaders(env: Env): HeadersInit {
+function corsHeaders(): HeadersInit {
   return {
-    'Access-Control-Allow-Origin': env.CORS_ORIGIN,
+    'Access-Control-Allow-Origin': CORS_ALLOWED_ORIGIN,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers':
       'Content-Type, Authorization, X-Session-Fingerprint, X-Session-Name, X-Session-Turn-Count, X-Share-Security',
@@ -59,16 +60,37 @@ function corsHeaders(env: Env): HeadersInit {
   };
 }
 
+function rejectDisallowedOrigin(request: Request): Response | null {
+  const origin = request.headers.get('Origin');
+  if (!origin || origin === CORS_ALLOWED_ORIGIN) {
+    return null;
+  }
+  return new Response(JSON.stringify({ error: 'Origin not allowed' }), {
+    status: 403,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+    const isApiRequest = path.startsWith('/api/');
+
+    if (isApiRequest) {
+      const originError = rejectDisallowedOrigin(request);
+      if (originError) {
+        return originError;
+      }
+    }
 
     // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders(env),
+        headers: corsHeaders(),
       });
     }
 
@@ -173,7 +195,7 @@ async function requireUser(request: Request, env: Env): Promise<GitHubUser | Res
     return new Response(JSON.stringify({ error: 'Missing bearer token' }), {
       status: 401,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -184,7 +206,7 @@ async function requireUser(request: Request, env: Env): Promise<GitHubUser | Res
     return new Response(JSON.stringify({ error: 'Missing bearer token' }), {
       status: 401,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -195,7 +217,7 @@ async function requireUser(request: Request, env: Env): Promise<GitHubUser | Res
     return new Response(JSON.stringify({ error: 'Invalid GitHub token' }), {
       status: 401,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -210,7 +232,7 @@ function handleGitHubClientId(env: Env): Response {
     return new Response(JSON.stringify({ error: 'GitHub login is not configured' }), {
       status: 503,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -218,7 +240,7 @@ function handleGitHubClientId(env: Env): Response {
 
   return new Response(JSON.stringify({ client_id: clientId }), {
     headers: {
-      ...corsHeaders(env),
+      ...corsHeaders(),
       'Content-Type': 'application/json',
     },
   });
@@ -239,7 +261,7 @@ async function handleListUploads(request: Request, env: Env): Promise<Response> 
 
   return new Response(JSON.stringify({ uploads }), {
     headers: {
-      ...corsHeaders(env),
+      ...corsHeaders(),
       'Content-Type': 'application/json',
     },
   });
@@ -256,7 +278,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ error: 'Missing X-Session-Fingerprint header' }), {
       status: 400,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -287,7 +309,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       {
         status: 200,
         headers: {
-          ...corsHeaders(env),
+          ...corsHeaders(),
           'Content-Type': 'application/json',
         },
       }
@@ -300,7 +322,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ error: 'Rate limit exceeded. Try again later.' }), {
       status: 429,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -312,7 +334,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ error: 'Empty body' }), {
       status: 400,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -323,7 +345,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ error: 'Session too large (max 10MB)' }), {
       status: 413,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -374,7 +396,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     {
       status: 201,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     }
@@ -387,7 +409,7 @@ async function handleDownload(id: string, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ error: 'Invalid session ID' }), {
       status: 400,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -398,7 +420,7 @@ async function handleDownload(id: string, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ error: 'Session not found' }), {
       status: 404,
       headers: {
-        ...corsHeaders(env),
+        ...corsHeaders(),
         'Content-Type': 'application/json',
       },
     });
@@ -406,7 +428,7 @@ async function handleDownload(id: string, env: Env): Promise<Response> {
 
   return new Response(object.body, {
     headers: {
-      ...corsHeaders(env),
+      ...corsHeaders(),
       'Content-Type': 'application/octet-stream',
       'Cache-Control': 'public, max-age=31536000, immutable',
       'X-Robots-Tag': 'noindex',

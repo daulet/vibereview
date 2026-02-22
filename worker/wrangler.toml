@@ -7,5 +7,4 @@ binding = "SESSIONS"
 bucket_name = "vibe-sessions"
 
 [vars]
-CORS_ORIGIN = "*"
-GITHUB_CLIENT_ID = ""
+GITHUB_CLIENT_ID = "Iv23liu80seXoxTlI93T"
