@@ -302,6 +302,26 @@ pub struct UnifiedSession {
 }
 
 impl UnifiedSession {
+    const LIST_ID_CHARS: usize = 12;
+
+    /// Get the short ID shown in the session browser list.
+    #[must_use]
+    pub fn list_id(&self) -> String {
+        let base_id = match self.source {
+            Source::Claude => self.name.clone(),
+            Source::Codex => {
+                let raw = self.resume_session_id();
+                raw.strip_prefix("rollout-").unwrap_or(&raw).to_string()
+            }
+        };
+        let short = base_id[..Self::LIST_ID_CHARS.min(base_id.len())].to_string();
+        if self.part_count > 1 {
+            format!("{short}×{}", self.part_count)
+        } else {
+            short
+        }
+    }
+
     /// Get the session ID to use for resuming (most recent session file).
     /// For Claude: returns the full filename stem (UUID)
     /// For Codex: extracts just the UUID from "rollout-DATE-UUID" format
@@ -2381,12 +2401,12 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Column widths:
-    // ID: 19 chars (e.g., "claude:063cd168×2")
+    // ID: 15 chars (e.g., "063cd168abcd×2")
     // TIME: 8 chars (e.g., "12h ago")
     // SOURCE: 6 chars (e.g., "claude")
     // PROJECT: 16 chars
     // DESCRIPTION: remaining
-    let id_width = 19;
+    let id_width = 15;
     let time_width = 8;
     let source_width = 6;
     let project_width = 16;
@@ -2441,18 +2461,8 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .sessions
         .iter()
         .map(|s| {
-            // Show part count for grouped sessions (e.g., "claude:063cd168×2")
-            let id = match s.source {
-                Source::Claude => {
-                    let base = format!("claude:{}", &s.name[..8.min(s.name.len())]);
-                    if s.part_count > 1 {
-                        format!("{}×{}", base, s.part_count)
-                    } else {
-                        base
-                    }
-                }
-                Source::Codex => format!("codex:{}", &s.name[..8.min(s.name.len())]),
-            };
+            // Show part count for grouped sessions (e.g., "063cd168×2")
+            let id = s.list_id();
             let time = format_time_ago(s.modified);
             let source = match s.source {
                 Source::Claude => "claude",
@@ -3973,17 +3983,7 @@ mod tests {
         let sessions = list_all_sessions();
 
         for session in &sessions {
-            let id = match session.source {
-                Source::Claude => {
-                    let base = format!("claude:{}", &session.name[..8.min(session.name.len())]);
-                    if session.part_count > 1 {
-                        format!("{}×{}", base, session.part_count)
-                    } else {
-                        base
-                    }
-                }
-                Source::Codex => format!("codex:{}", &session.name[..8.min(session.name.len())]),
-            };
+            let id = session.list_id();
 
             // Verify format
             if session.part_count > 1 {
@@ -3992,7 +3992,7 @@ mod tests {
                     "Grouped session should have × indicator: {}",
                     id
                 );
-            } else if session.source == Source::Claude {
+            } else {
                 assert!(
                     !id.contains('×'),
                     "Single session should not have × indicator: {}",
@@ -4000,6 +4000,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_codex_list_id_strips_rollout_prefix() {
+        let session = UnifiedSession {
+            source: Source::Codex,
+            paths: Vec::new(),
+            name: "rollout-abcdef1234567890".to_string(),
+            project: "test".to_string(),
+            project_path: PathBuf::from("/tmp/test"),
+            modified: None,
+            description: None,
+            slug: None,
+            part_count: 1,
+        };
+
+        assert_eq!(session.list_id(), "abcdef123456");
     }
 
     // ==================== RESUME COMMAND TESTS ====================
