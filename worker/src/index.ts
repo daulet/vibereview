@@ -726,7 +726,7 @@ function generateHomeHtml(): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>VibeReview - Public Sessions</title>
+  <title>VibeReview - Share your Claude Code and Codex sessions</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
