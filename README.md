@@ -28,7 +28,6 @@ Keep the full URL to share or import via:
 Cloud uploads require GitHub login:
 
 ```bash
-export VIBEREVIEW_SHARE_API_URL="https://<worker-domain>/api/sessions"
 vibereview login
 ```
 
@@ -37,3 +36,5 @@ List uploads associated with your GitHub identity:
 ```bash
 vibereview uploads
 ```
+
+Website home page (`/`) lists recent public uploads.

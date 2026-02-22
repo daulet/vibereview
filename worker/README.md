@@ -4,6 +4,7 @@ Cloudflare Worker for session sharing. Handles upload, storage (R2), and web vie
 New shares are encrypted client-side by default (with optional public mode);
 the worker stores whatever payload the client uploads.
 Uploads and upload listing are authenticated via GitHub user identity.
+Public-mode uploads are additionally indexed for the website home page.
 
 ## Setup
 
@@ -45,8 +46,10 @@ npm run dev
 | `/api/auth/github/client-id` | GET | Returns configured GitHub OAuth client ID |
 | `/api/sessions` | POST | Upload payload (encrypted by default, public optional). Requires `Authorization: Bearer <github_token>`. Returns `{id, url}` |
 | `/api/uploads` | GET | List uploads for authenticated GitHub user (`Authorization` required) |
+| `/api/public-uploads` | GET | List recent public uploads for website home page |
 | `/api/sessions/:id` | GET | Get stored payload |
 | `/s/:id` | GET | Web viewer (for encrypted links include key fragment, e.g. `#k=...`) |
+| `/` | GET | Home page listing recent public uploads |
 
 ## Rate Limits
 

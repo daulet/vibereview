@@ -6,6 +6,10 @@ export interface Env {
 }
 
 const CORS_ALLOWED_ORIGIN = 'https://vibereview.trustme.workers.dev';
+const PUBLIC_INDEX_KEY = 'public/recent.json';
+const PUBLIC_INDEX_LIMIT = 1000;
+const DEFAULT_PUBLIC_LIST_LIMIT = 50;
+const MAX_PUBLIC_LIST_LIMIT = 200;
 
 // Rate limiting: Track uploads per IP (in-memory, resets on worker restart)
 const uploadCounts = new Map<string, { count: number; resetAt: number }>();
@@ -31,6 +35,19 @@ interface UploadRecord {
 interface UserUploadIndex {
   version: 1;
   uploads: UploadRecord[];
+}
+
+interface PublicUploadRecord {
+  id: string;
+  uploaded_at: string;
+  session_name?: string;
+  turn_count?: number;
+  owner_login?: string;
+}
+
+interface PublicUploadIndex {
+  version: 1;
+  uploads: PublicUploadRecord[];
 }
 
 function checkRateLimit(ip: string): boolean {
@@ -107,6 +124,10 @@ export default {
       return handleListUploads(request, env);
     }
 
+    if (path === '/api/public-uploads' && request.method === 'GET') {
+      return handleListPublicUploads(request, env);
+    }
+
     if (path.startsWith('/api/sessions/') && request.method === 'GET') {
       const id = path.slice('/api/sessions/'.length);
       return handleDownload(id, env);
@@ -118,9 +139,9 @@ export default {
       return handleViewer(id, request, env);
     }
 
-    // Redirect root to GitHub
+    // Home page
     if (path === '/') {
-      return Response.redirect('https://github.com/dzhanguzin/vibereview', 302);
+      return handleHome();
     }
 
     return new Response('Not Found', { status: 404 });
@@ -158,6 +179,37 @@ async function saveUserIndex(env: Env, userId: number, index: UserUploadIndex): 
   await env.SESSIONS.put(userIndexKey(userId), JSON.stringify(index), {
     httpMetadata: { contentType: 'application/json' },
   });
+}
+
+async function loadPublicIndex(env: Env): Promise<PublicUploadIndex> {
+  const object = await env.SESSIONS.get(PUBLIC_INDEX_KEY);
+  if (!object) {
+    return { version: 1, uploads: [] };
+  }
+  try {
+    const parsed = JSON.parse(await object.text()) as PublicUploadIndex;
+    if (parsed.version === 1 && Array.isArray(parsed.uploads)) {
+      return parsed;
+    }
+    return { version: 1, uploads: [] };
+  } catch {
+    return { version: 1, uploads: [] };
+  }
+}
+
+async function savePublicIndex(env: Env, index: PublicUploadIndex): Promise<void> {
+  await env.SESSIONS.put(PUBLIC_INDEX_KEY, JSON.stringify(index), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+}
+
+async function upsertPublicUpload(env: Env, upload: PublicUploadRecord): Promise<void> {
+  const index = await loadPublicIndex(env);
+  const deduped = index.uploads.filter((item) => item.id !== upload.id);
+  deduped.unshift(upload);
+  deduped.sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at));
+  index.uploads = deduped.slice(0, PUBLIC_INDEX_LIMIT);
+  await savePublicIndex(env, index);
 }
 
 async function authenticateGitHubUser(accessToken: string): Promise<GitHubUser | null> {
@@ -267,6 +319,35 @@ async function handleListUploads(request: Request, env: Env): Promise<Response> 
   });
 }
 
+async function handleListPublicUploads(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const limitRaw = Number.parseInt(url.searchParams.get('limit') || '', 10);
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(limitRaw, MAX_PUBLIC_LIST_LIMIT)
+      : DEFAULT_PUBLIC_LIST_LIMIT;
+
+  const index = await loadPublicIndex(env);
+  const baseUrl = url.origin;
+  const uploads = index.uploads
+    .slice()
+    .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at))
+    .slice(0, limit)
+    .map((item) => ({
+    ...item,
+    security: 'public' as const,
+    url: `${baseUrl}/s/${item.id}`,
+    }));
+
+  return new Response(JSON.stringify({ uploads }), {
+    headers: {
+      ...corsHeaders(),
+      'Content-Type': 'application/json',
+      'Cache-Control': 'public, max-age=30',
+    },
+  });
+}
+
 async function handleUpload(request: Request, env: Env): Promise<Response> {
   const authResult = await requireUser(request, env);
   if (authResult instanceof Response) {
@@ -299,6 +380,15 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     (item) => item.fingerprint === fingerprint && item.security === security
   );
   if (existing) {
+    if (security === 'public') {
+      await upsertPublicUpload(env, {
+        id: existing.id,
+        uploaded_at: existing.uploaded_at,
+        session_name: existing.session_name,
+        turn_count: existing.turn_count,
+        owner_login: authResult.login,
+      });
+    }
     const baseUrl = new URL(request.url).origin;
     return new Response(
       JSON.stringify({
@@ -384,6 +474,16 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   index.uploads = index.uploads.slice(0, 1000);
   await saveUserIndex(env, authResult.id, index);
 
+  if (security === 'public') {
+    await upsertPublicUpload(env, {
+      id,
+      uploaded_at: uploadedAt,
+      session_name: sessionName,
+      turn_count: normalizedTurnCount,
+      owner_login: authResult.login,
+    });
+  }
+
   const baseUrl = new URL(request.url).origin;
   const shareUrl = `${baseUrl}/s/${id}`;
 
@@ -436,6 +536,16 @@ async function handleDownload(id: string, env: Env): Promise<Response> {
   });
 }
 
+function handleHome(): Response {
+  const html = generateHomeHtml();
+  return new Response(html, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'public, max-age=60',
+    },
+  });
+}
+
 async function handleViewer(id: string, request: Request, env: Env): Promise<Response> {
   // Validate ID format
   if (!/^[A-Za-z0-9_-]{12}$/.test(id)) {
@@ -458,6 +568,301 @@ async function handleViewer(id: string, request: Request, env: Env): Promise<Res
       'Cache-Control': 'no-cache',
     },
   });
+}
+
+function generateHomeHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VibeReview - Public Sessions</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+    :root {
+      --bg: #f4f7f2;
+      --bg-elev: #ffffff;
+      --ink: #15231f;
+      --muted: #49605a;
+      --line: #d6e2db;
+      --accent: #067a62;
+      --accent-soft: #daf7ef;
+      --shadow: 0 14px 30px rgba(12, 52, 41, 0.1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #d5eee5 0%, transparent 70%),
+        radial-gradient(900px 500px at 100% 0%, #e7f2dc 0%, transparent 65%),
+        var(--bg);
+      color: var(--ink);
+      font-family: 'Sora', 'Avenir Next', 'Segoe UI', sans-serif;
+    }
+
+    .page {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 28px 18px 40px;
+    }
+
+    .hero {
+      background: linear-gradient(130deg, #ffffff 0%, #f3fbf7 60%, #f7f9ec 100%);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: var(--shadow);
+      animation: rise 220ms ease-out;
+    }
+
+    .eyebrow {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: #035341;
+      font: 500 12px/1 'IBM Plex Mono', monospace;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 10px 0 10px;
+      font-size: clamp(1.8rem, 4.6vw, 2.6rem);
+      line-height: 1.06;
+      letter-spacing: -0.02em;
+    }
+
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 70ch;
+      line-height: 1.55;
+    }
+
+    .meta {
+      margin-top: 14px;
+      color: var(--muted);
+      font: 500 12px/1 'IBM Plex Mono', monospace;
+    }
+
+    .list-head {
+      margin: 24px 4px 12px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .list-head h2 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+
+    .list-head .hint {
+      color: var(--muted);
+      font: 500 12px/1 'IBM Plex Mono', monospace;
+    }
+
+    .uploads {
+      display: grid;
+      gap: 10px;
+    }
+
+    .upload-card {
+      text-decoration: none;
+      color: inherit;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--bg-elev);
+      box-shadow: 0 7px 18px rgba(15, 56, 44, 0.07);
+      padding: 14px 16px;
+      display: block;
+      transition: transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+      animation: rise 220ms ease-out both;
+    }
+
+    .upload-card:hover {
+      transform: translateY(-1px);
+      border-color: #9bc8bc;
+      box-shadow: 0 10px 22px rgba(13, 52, 42, 0.12);
+    }
+
+    .upload-title {
+      margin: 0 0 7px;
+      font-size: 1rem;
+      font-weight: 600;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .upload-meta {
+      margin: 0;
+      color: var(--muted);
+      font: 500 12px/1.4 'IBM Plex Mono', monospace;
+    }
+
+    .empty {
+      border: 1px dashed #b8cbc3;
+      border-radius: 14px;
+      background: #fbfdfb;
+      padding: 16px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .status {
+      color: var(--muted);
+      font: 500 13px/1.5 'IBM Plex Mono', monospace;
+      margin: 0 4px;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(8px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (max-width: 680px) {
+      .page {
+        padding: 18px 12px 28px;
+      }
+      .hero {
+        padding: 18px 14px;
+      }
+      .upload-card {
+        padding: 12px 12px;
+      }
+      .list-head {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <span class="eyebrow">VibeReview Cloud</span>
+      <h1>Recent Public Sessions</h1>
+      <p>
+        Browse sessions that were shared in public mode. Click any item to open it in the viewer.
+        Encrypted shares stay private and do not appear on this page.
+      </p>
+      <div class="meta">Source: /api/public-uploads</div>
+    </section>
+
+    <div class="list-head">
+      <h2>Latest uploads</h2>
+      <span class="hint">Most recent first</span>
+    </div>
+    <p id="status" class="status">Loading public uploads...</p>
+    <section id="uploads" class="uploads" aria-live="polite"></section>
+  </main>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const uploadsEl = document.getElementById('uploads');
+
+    function formatDate(isoValue) {
+      const date = new Date(isoValue);
+      if (Number.isNaN(date.valueOf())) {
+        return isoValue || 'unknown';
+      }
+      return new Intl.DateTimeFormat(undefined, {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      }).format(date);
+    }
+
+    function makeMeta(item) {
+      const parts = [];
+      if (typeof item.turn_count === 'number') {
+        parts.push(item.turn_count + ' turns');
+      }
+      if (item.owner_login) {
+        parts.push('by @' + item.owner_login);
+      }
+      parts.push(formatDate(item.uploaded_at));
+      return parts.join(' · ');
+    }
+
+    function renderEmpty() {
+      uploadsEl.innerHTML = '';
+      const div = document.createElement('div');
+      div.className = 'empty';
+      div.textContent = 'No public uploads yet. Share a session in public mode to populate this page.';
+      uploadsEl.appendChild(div);
+    }
+
+    function renderUploads(uploads) {
+      uploadsEl.innerHTML = '';
+      if (!Array.isArray(uploads) || uploads.length === 0) {
+        renderEmpty();
+        return;
+      }
+
+      uploads.forEach((item, index) => {
+        const card = document.createElement('a');
+        card.className = 'upload-card';
+        card.href = item.url;
+        card.style.animationDelay = (index * 30) + 'ms';
+
+        const title = document.createElement('h3');
+        title.className = 'upload-title';
+        title.textContent = item.session_name || 'Untitled session';
+
+        const meta = document.createElement('p');
+        meta.className = 'upload-meta';
+        meta.textContent = makeMeta(item);
+
+        card.appendChild(title);
+        card.appendChild(meta);
+        uploadsEl.appendChild(card);
+      });
+    }
+
+    async function loadPublicUploads() {
+      try {
+        const response = await fetch('/api/public-uploads?limit=80', {
+          headers: { Accept: 'application/json' }
+        });
+        if (!response.ok) {
+          throw new Error('HTTP ' + response.status);
+        }
+        const payload = await response.json();
+        const uploads = Array.isArray(payload.uploads) ? payload.uploads : [];
+        statusEl.textContent = uploads.length + ' public ' + (uploads.length === 1 ? 'upload' : 'uploads');
+        renderUploads(uploads);
+      } catch (error) {
+        statusEl.textContent = 'Failed to load public uploads.';
+        uploadsEl.innerHTML = '';
+        const div = document.createElement('div');
+        div.className = 'empty';
+        div.textContent = 'Try refreshing in a moment.';
+        uploadsEl.appendChild(div);
+      }
+    }
+
+    loadPublicUploads();
+  </script>
+</body>
+</html>`;
 }
 
 function generateViewerHtml(sessionId: string): string {
