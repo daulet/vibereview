@@ -9,6 +9,7 @@
 
 # Bugs
 
+- [ ] Speed up launch
 - [x] text selection is broken - selects wrong rows
 - [ ] Add links to github
 - [ ] Make friendlier readme with install and privacy explanations
