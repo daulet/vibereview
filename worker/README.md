@@ -54,4 +54,6 @@ npm run dev
 ## Rate Limits
 
 - 10 uploads per hour per IP
+- Unauthenticated read routes (`/`, `/s/:id`, `/api/sessions/public`, `/api/sessions/:id`) are
+  throttled via Durable Object token buckets
 - Max session size: 10MB

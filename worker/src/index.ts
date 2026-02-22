@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid';
 
 export interface Env {
   SESSIONS: R2Bucket;
+  RATE_LIMITER: DurableObjectNamespace;
   GITHUB_CLIENT_ID: string;
 }
 
@@ -10,6 +11,7 @@ const PUBLIC_INDEX_KEY = 'public/recent.json';
 const PUBLIC_INDEX_LIMIT = 1000;
 const DEFAULT_PUBLIC_LIST_LIMIT = 50;
 const MAX_PUBLIC_LIST_LIMIT = 200;
+const UNAUTH_RATE_LIMIT_SHARDS = 32;
 
 // Rate limiting: Track uploads per IP (in-memory, resets on worker restart)
 const uploadCounts = new Map<string, { count: number; resetAt: number }>();
@@ -50,6 +52,31 @@ interface PublicUploadIndex {
   uploads: PublicUploadRecord[];
 }
 
+type UnauthenticatedRouteName = 'home' | 'viewer' | 'public_list' | 'session_payload';
+
+interface RouteRateLimitProfile {
+  limit: number;
+  windowSeconds: number;
+}
+
+interface RateLimitCheckPayload {
+  key: string;
+  limit: number;
+  windowSeconds: number;
+}
+
+interface RateLimitCheckResult {
+  allowed: boolean;
+  retryAfterSeconds: number;
+}
+
+const UNAUTH_ROUTE_LIMITS: Record<UnauthenticatedRouteName, RouteRateLimitProfile> = {
+  home: { limit: 120, windowSeconds: 60 },
+  viewer: { limit: 120, windowSeconds: 60 },
+  public_list: { limit: 90, windowSeconds: 60 },
+  session_payload: { limit: 180, windowSeconds: 60 },
+};
+
 function checkRateLimit(ip: string): boolean {
   const now = Date.now();
   const record = uploadCounts.get(ip);
@@ -65,6 +92,121 @@ function checkRateLimit(ip: string): boolean {
 
   record.count++;
   return true;
+}
+
+function unauthenticatedRouteName(path: string, method: string): UnauthenticatedRouteName | null {
+  if (method !== 'GET') {
+    return null;
+  }
+  if (path === '/') {
+    return 'home';
+  }
+  if (path.startsWith('/s/')) {
+    return 'viewer';
+  }
+  if (path === '/api/sessions/public') {
+    return 'public_list';
+  }
+  if (path.startsWith('/api/sessions/')) {
+    return 'session_payload';
+  }
+  return null;
+}
+
+function requestClientAddress(request: Request): string {
+  const cfConnectingIp = request.headers.get('CF-Connecting-IP')?.trim();
+  if (cfConnectingIp) {
+    return cfConnectingIp;
+  }
+  const xForwardedFor = request.headers.get('X-Forwarded-For');
+  if (xForwardedFor) {
+    const first = xForwardedFor.split(',')[0]?.trim();
+    if (first) {
+      return first;
+    }
+  }
+  return 'unknown';
+}
+
+function shardForClient(client: string): number {
+  let hash = 5381;
+  for (let i = 0; i < client.length; i++) {
+    hash = (hash * 33) ^ client.charCodeAt(i);
+  }
+  return Math.abs(hash) % UNAUTH_RATE_LIMIT_SHARDS;
+}
+
+function rateLimitExceededResponse(
+  isApiRequest: boolean,
+  retryAfterSeconds: number
+): Response {
+  const retryAfter = Math.max(1, retryAfterSeconds);
+  if (isApiRequest) {
+    return new Response(
+      JSON.stringify({
+        error: 'Rate limit exceeded. Try again later.',
+        retry_after_seconds: retryAfter,
+      }),
+      {
+        status: 429,
+        headers: {
+          ...corsHeaders(),
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-store',
+          'Retry-After': String(retryAfter),
+        },
+      }
+    );
+  }
+
+  return new Response('Rate limit exceeded. Try again later.', {
+    status: 429,
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Retry-After': String(retryAfter),
+    },
+  });
+}
+
+async function enforceUnauthenticatedRateLimit(
+  request: Request,
+  env: Env,
+  route: UnauthenticatedRouteName
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  const isApiPath = path.startsWith('/api/');
+  const profile = UNAUTH_ROUTE_LIMITS[route];
+  const client = requestClientAddress(request);
+  const shard = shardForClient(client);
+  const id = env.RATE_LIMITER.idFromName(`unauth:${route}:shard:${shard}`);
+  const stub = env.RATE_LIMITER.get(id);
+
+  const payload: RateLimitCheckPayload = {
+    key: client,
+    limit: profile.limit,
+    windowSeconds: profile.windowSeconds,
+  };
+
+  // Fail open if the limiter is unavailable; don't block all traffic.
+  let decision: RateLimitCheckResult | null = null;
+  try {
+    const response = await stub.fetch('https://rate-limiter/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (response.ok) {
+      decision = (await response.json()) as RateLimitCheckResult;
+    }
+  } catch {
+    return null;
+  }
+
+  if (!decision || decision.allowed) {
+    return null;
+  }
+  return rateLimitExceededResponse(isApiPath, decision.retryAfterSeconds);
 }
 
 function corsHeaders(): HeadersInit {
@@ -100,6 +242,14 @@ export default {
       const originError = rejectDisallowedOrigin(request);
       if (originError) {
         return originError;
+      }
+    }
+
+    const unauthRoute = unauthenticatedRouteName(path, request.method);
+    if (unauthRoute) {
+      const rateLimitResponse = await enforceUnauthenticatedRateLimit(request, env, unauthRoute);
+      if (rateLimitResponse) {
+        return rateLimitResponse;
       }
     }
 
@@ -863,6 +1013,73 @@ function generateHomeHtml(): string {
   </script>
 </body>
 </html>`;
+}
+
+interface DurableRateLimitState {
+  tokens: number;
+  lastRefillMs: number;
+}
+
+export class UnauthenticatedRateLimiter {
+  constructor(private readonly state: DurableObjectState) {}
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 });
+    }
+
+    let payload: RateLimitCheckPayload;
+    try {
+      payload = (await request.json()) as RateLimitCheckPayload;
+    } catch {
+      return new Response('Invalid JSON', { status: 400 });
+    }
+
+    const limit = Number(payload.limit);
+    const windowSeconds = Number(payload.windowSeconds);
+    const key = String(payload.key || '').trim();
+
+    if (!key || !Number.isFinite(limit) || !Number.isFinite(windowSeconds)) {
+      return new Response('Invalid rate limit payload', { status: 400 });
+    }
+    if (limit <= 0 || windowSeconds <= 0) {
+      return new Response('Invalid rate limit profile', { status: 400 });
+    }
+
+    const now = Date.now();
+    const windowMs = windowSeconds * 1000;
+    const refillPerMs = limit / windowMs;
+    const storageKey = `client:${key}`;
+
+    const state =
+      (await this.state.storage.get<DurableRateLimitState>(storageKey)) ??
+      ({
+        tokens: limit,
+        lastRefillMs: now,
+      } satisfies DurableRateLimitState);
+
+    if (now > state.lastRefillMs) {
+      const elapsedMs = now - state.lastRefillMs;
+      state.tokens = Math.min(limit, state.tokens + elapsedMs * refillPerMs);
+      state.lastRefillMs = now;
+    }
+
+    let allowed = false;
+    let retryAfterSeconds = 0;
+    if (state.tokens >= 1) {
+      allowed = true;
+      state.tokens -= 1;
+    } else {
+      const deficit = 1 - state.tokens;
+      retryAfterSeconds = Math.max(1, Math.ceil(deficit / refillPerMs / 1000));
+    }
+
+    await this.state.storage.put(storageKey, state);
+
+    return new Response(JSON.stringify({ allowed, retryAfterSeconds }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 }
 
 function generateViewerHtml(sessionId: string): string {
