@@ -1023,6 +1023,7 @@ fn filter_session(session: &Session, mode: ShareExportMode) -> Session {
                 timestamp: turn.timestamp.clone(),
                 user_prompt: turn.user_prompt.clone(),
                 thinking: None,
+                thinking_effort: turn.thinking_effort.clone(),
                 tool_invocations: Vec::new(),
                 response: turn.response.clone(),
                 model: turn.model.clone(),
@@ -1032,6 +1033,7 @@ fn filter_session(session: &Session, mode: ShareExportMode) -> Session {
                 timestamp: turn.timestamp.clone(),
                 user_prompt: turn.user_prompt.clone(),
                 thinking: None,
+                thinking_effort: turn.thinking_effort.clone(),
                 tool_invocations: diff_only_invocations(turn),
                 response: turn.response.clone(),
                 model: turn.model.clone(),
@@ -1311,6 +1313,7 @@ mod tests {
                 timestamp: None,
                 user_prompt: prompt.to_string(),
                 thinking: None,
+                thinking_effort: None,
                 tool_invocations: Vec::new(),
                 response: response.to_string(),
                 model: None,
@@ -1332,6 +1335,7 @@ mod tests {
                 timestamp: Some("2024-01-01T00:00:00Z".to_string()),
                 user_prompt: "Hello, world!".to_string(),
                 thinking: Some("Thinking...".to_string()),
+                thinking_effort: Some("high".to_string()),
                 tool_invocations: vec![],
                 response: "Hi there!".to_string(),
                 model: Some("claude-3".to_string()),
@@ -1361,6 +1365,7 @@ mod tests {
                 timestamp: None,
                 user_prompt: "u".to_string(),
                 thinking: Some("think".to_string()),
+                thinking_effort: Some("high".to_string()),
                 tool_invocations: vec![ToolInvocation {
                     id: "tool1".to_string(),
                     tool_type: ToolType::Command {
@@ -1385,6 +1390,10 @@ mod tests {
         assert_eq!(parsed.session.turns.len(), 1);
         assert!(parsed.session.turns[0].tool_invocations.is_empty());
         assert!(parsed.session.turns[0].thinking.is_none());
+        assert_eq!(
+            parsed.session.turns[0].thinking_effort,
+            Some("high".to_string())
+        );
     }
 
     #[test]
@@ -1401,6 +1410,7 @@ mod tests {
                 timestamp: None,
                 user_prompt: "u".to_string(),
                 thinking: Some("think".to_string()),
+                thinking_effort: Some("xhigh".to_string()),
                 tool_invocations: vec![ToolInvocation {
                     id: "tool1".to_string(),
                     tool_type: ToolType::FileEdit {
@@ -1425,6 +1435,10 @@ mod tests {
         assert_eq!(parsed.mode, ShareExportMode::PromptResponseAndDiff);
         assert_eq!(parsed.session.turns.len(), 1);
         assert_eq!(parsed.session.turns[0].tool_invocations.len(), 1);
+        assert_eq!(
+            parsed.session.turns[0].thinking_effort,
+            Some("xhigh".to_string())
+        );
         let only = &parsed.session.turns[0].tool_invocations[0];
         assert!(matches!(only.tool_type, ToolType::FileEdit { .. }));
         assert_eq!(only.input_display, "[redacted]");
@@ -1500,6 +1514,7 @@ mod tests {
                 timestamp: None,
                 user_prompt: "hello".to_string(),
                 thinking: None,
+                thinking_effort: None,
                 tool_invocations: Vec::new(),
                 response: "world".to_string(),
                 model: None,
@@ -1519,6 +1534,7 @@ mod tests {
             timestamp: None,
             user_prompt: "hello".to_string(),
             thinking: None,
+            thinking_effort: None,
             tool_invocations: Vec::new(),
             response: "world".to_string(),
             model: None,

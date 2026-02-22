@@ -1988,8 +1988,11 @@ function generateViewerHtml(sessionId: string): string {
       if (!turn.thinking) {
         return '<div class="empty-state">No thinking available for this turn</div>';
       }
+      const heading = turn.thinking_effort
+        ? 'Model Thinking (' + escapeHtml(turn.thinking_effort) + '):'
+        : 'Model Thinking:';
       return \`
-        <div class="section-header magenta">Model Thinking:</div>
+        <div class="section-header magenta">\${heading}</div>
         <div class="markdown-content">\${marked.parse(turn.thinking)}</div>
       \`;
     }

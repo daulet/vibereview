@@ -244,6 +244,7 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
     let mut session_id = name.to_string();
     let mut cli_version = None;
     let mut model = None;
+    let mut thinking_effort = None;
     let mut project_path = None;
 
     let mut entries: Vec<Value> = Vec::new();
@@ -271,8 +272,11 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
             // Extract model from turn_context
             if value.get("type").and_then(|t| t.as_str()) == Some("turn_context") {
                 if let Some(payload) = value.get("payload") {
-                    if let Some(m) = payload.get("model").and_then(|m| m.as_str()) {
-                        model = Some(m.to_string());
+                    if let Some(model_value) = payload.get("model") {
+                        model = model_value.as_str().map(String::from);
+                    }
+                    if let Some(effort) = extract_reasoning_effort(payload) {
+                        thinking_effort = effort;
                     }
                 }
             }
@@ -280,7 +284,7 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
         }
     }
 
-    let turns = build_turns_from_jsonl(&entries, model.as_deref());
+    let turns = build_turns_from_jsonl(&entries, model.as_deref(), thinking_effort.as_deref());
 
     Ok(Session {
         id: session_id,
@@ -291,6 +295,17 @@ fn parse_jsonl_session(path: &Path, name: &str) -> Result<Session, String> {
         project_path,
         turns,
     })
+}
+
+fn extract_reasoning_effort(payload: &Value) -> Option<Option<String>> {
+    if let Some(effort) = payload.get("reasoning_effort") {
+        return Some(effort.as_str().map(String::from));
+    }
+
+    payload
+        .get("collaboration_mode")
+        .and_then(|mode| mode.get("reasoning_effort"))
+        .map(|effort| effort.as_str().map(String::from))
 }
 
 /// Parse old JSON format session.
@@ -327,10 +342,16 @@ fn parse_json_session(path: &Path, name: &str) -> Result<Session, String> {
 }
 
 /// Build turns from JSONL entries.
-fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec<Turn> {
+fn build_turns_from_jsonl(
+    entries: &[Value],
+    default_model: Option<&str>,
+    default_thinking_effort: Option<&str>,
+) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut current_turn: Option<Turn> = None;
     let mut pending_calls: HashMap<String, Value> = HashMap::new();
+    let mut current_model = default_model.map(String::from);
+    let mut current_thinking_effort = default_thinking_effort.map(String::from);
 
     for entry in entries {
         let entry_type = entry.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -340,6 +361,16 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
             .map(String::from);
 
         match entry_type {
+            "turn_context" => {
+                if let Some(payload) = entry.get("payload") {
+                    if let Some(model_value) = payload.get("model") {
+                        current_model = model_value.as_str().map(String::from);
+                    }
+                    if let Some(effort) = extract_reasoning_effort(payload) {
+                        current_thinking_effort = effort;
+                    }
+                }
+            }
             "event_msg" => {
                 if let Some(payload) = entry.get("payload") {
                     let msg_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -364,9 +395,10 @@ fn build_turns_from_jsonl(entries: &[Value], default_model: Option<&str>) -> Vec
                                 timestamp,
                                 user_prompt: message,
                                 thinking: None,
+                                thinking_effort: current_thinking_effort.clone(),
                                 tool_invocations: Vec::new(),
                                 response: String::new(),
-                                model: default_model.map(String::from),
+                                model: current_model.clone(),
                             });
                         }
                         "agent_reasoning" => {
@@ -505,6 +537,7 @@ fn build_turns_from_json(items: &[Value]) -> Vec<Turn> {
                             timestamp: None,
                             user_prompt: content,
                             thinking: None,
+                            thinking_effort: None,
                             tool_invocations: Vec::new(),
                             response: String::new(),
                             model: None,
@@ -817,11 +850,71 @@ mod tests {
             }),
         ];
 
-        let turns = build_turns_from_jsonl(&entries, Some("gpt-4"));
+        let turns = build_turns_from_jsonl(&entries, Some("gpt-4"), None);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].user_prompt, "Analyze the project");
         assert!(turns[0].response.contains("analysis"));
         assert_eq!(turns[0].model, Some("gpt-4".to_string()));
+    }
+
+    #[test]
+    fn test_build_turns_from_jsonl_with_turn_context_reasoning_effort() {
+        let entries = vec![
+            json!({
+                "type": "turn_context",
+                "payload": {
+                    "model": "gpt-5.2-codex",
+                    "collaboration_mode": {
+                        "reasoning_effort": "high"
+                    }
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "First question"
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "First answer"
+                }
+            }),
+            json!({
+                "type": "turn_context",
+                "payload": {
+                    "collaboration_mode": {
+                        "reasoning_effort": null
+                    }
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Second question"
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "Second answer"
+                }
+            }),
+        ];
+
+        let turns = build_turns_from_jsonl(&entries, None, None);
+        assert_eq!(turns.len(), 2);
+
+        assert_eq!(turns[0].model, Some("gpt-5.2-codex".to_string()));
+        assert_eq!(turns[0].thinking_effort, Some("high".to_string()));
+
+        assert_eq!(turns[1].model, Some("gpt-5.2-codex".to_string()));
+        assert!(turns[1].thinking_effort.is_none());
     }
 
     #[test]
@@ -857,7 +950,7 @@ mod tests {
             }),
         ];
 
-        let turns = build_turns_from_jsonl(&entries, None);
+        let turns = build_turns_from_jsonl(&entries, None, None);
         assert_eq!(turns.len(), 1);
         assert!(turns[0].thinking.is_some());
         let thinking = turns[0].thinking.as_ref().unwrap();
@@ -901,7 +994,7 @@ mod tests {
             }),
         ];
 
-        let turns = build_turns_from_jsonl(&entries, None);
+        let turns = build_turns_from_jsonl(&entries, None, None);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].tool_invocations.len(), 1);
 
@@ -942,7 +1035,7 @@ mod tests {
             }),
         ];
 
-        let turns = build_turns_from_jsonl(&entries, None);
+        let turns = build_turns_from_jsonl(&entries, None, None);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].tool_invocations.len(), 1);
 
@@ -962,7 +1055,7 @@ mod tests {
             json!({"type": "event_msg", "payload": {"type": "agent_message", "message": "Second answer"}}),
         ];
 
-        let turns = build_turns_from_jsonl(&entries, None);
+        let turns = build_turns_from_jsonl(&entries, None, None);
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].user_prompt, "First question");
         assert_eq!(turns[1].user_prompt, "Second question");

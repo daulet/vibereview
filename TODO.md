@@ -6,6 +6,8 @@
 - [ ] Similar options to share only prompt when uploading to cloud
 - [x] Scan for secrets in sessions
 - [ ] List model used, thinking mode
+- [ ] Add version flag
+- [ ] Re-learn thinking metadata, mostly missing
 
 # Bugs
 

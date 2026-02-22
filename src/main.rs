@@ -280,6 +280,15 @@ pub enum ResumeState {
     },
 }
 
+#[derive(Debug, Clone)]
+pub enum TurnMetadataState {
+    Idle,
+    Showing {
+        session_name: String,
+        content: String,
+    },
+}
+
 /// A unified session that can come from either source.
 /// Claude sessions with the same slug in the same project are grouped together.
 #[derive(Debug, Clone)]
@@ -737,6 +746,8 @@ pub struct App {
     pub upload_state: UploadState,
     /// State of the resume operation
     pub resume_state: ResumeState,
+    /// State of the per-turn model/effort debug view
+    pub turn_metadata_state: TurnMetadataState,
     /// Copy feedback with source info (clears after 1.5s)
     pub copy_feedback: Option<CopyFeedback>,
     /// Current text selection state
@@ -779,6 +790,7 @@ impl App {
             error_message: None,
             upload_state: UploadState::Idle,
             resume_state: ResumeState::Idle,
+            turn_metadata_state: TurnMetadataState::Idle,
             copy_feedback: None,
             text_selection: None,
             content_area: None,
@@ -1017,6 +1029,11 @@ impl App {
             return;
         }
 
+        if !matches!(self.turn_metadata_state, TurnMetadataState::Idle) {
+            self.handle_turn_metadata_key(key);
+            return;
+        }
+
         match self.view {
             View::SessionBrowser => self.handle_session_browser_key(key),
             View::SessionViewer => self.handle_session_viewer_key(key),
@@ -1139,6 +1156,46 @@ impl App {
             }
             ResumeState::Idle => {}
         }
+    }
+
+    fn handle_turn_metadata_key(&mut self, key: KeyCode) {
+        if let TurnMetadataState::Showing { content, .. } = &self.turn_metadata_state {
+            if key == KeyCode::Char('c') {
+                self.copy_to_clipboard(Some(content.clone()), CopySource::Tab("Metadata".into()));
+                return;
+            }
+        }
+        self.turn_metadata_state = TurnMetadataState::Idle;
+    }
+
+    fn open_turn_metadata_view(&mut self) {
+        match self.resolve_metadata_session() {
+            Ok(session) => {
+                self.turn_metadata_state = TurnMetadataState::Showing {
+                    session_name: session.name.clone(),
+                    content: build_turn_metadata_report(&session),
+                };
+            }
+            Err(message) => {
+                self.error_message = Some(message);
+            }
+        }
+    }
+
+    fn resolve_metadata_session(&self) -> std::result::Result<Session, String> {
+        if let Some(session) = &self.session {
+            return Ok(session.clone());
+        }
+
+        let selected = self
+            .session_list_state
+            .selected()
+            .and_then(|i| self.sessions.get(i))
+            .ok_or_else(|| "No session selected".to_string())?;
+
+        selected
+            .parse()
+            .map_err(|e| format!("Failed to parse session: {e}"))
     }
 
     fn begin_upload(
@@ -1345,6 +1402,9 @@ impl App {
             KeyCode::Char('/') => {
                 self.start_search(SearchScope::SessionList);
             }
+            KeyCode::Char('m') => {
+                self.open_turn_metadata_view();
+            }
             _ => {}
         }
     }
@@ -1488,6 +1548,9 @@ impl App {
                         self.resume_state = ResumeState::Confirming { command: cmd };
                     }
                 }
+            }
+            KeyCode::Char('m') => {
+                self.open_turn_metadata_view();
             }
             _ => {}
         }
@@ -2005,6 +2068,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if !matches!(app.resume_state, ResumeState::Idle) {
         render_resume_modal(frame, app);
     }
+
+    // Render turn metadata debug modal if active
+    if !matches!(app.turn_metadata_state, TurnMetadataState::Idle) {
+        render_turn_metadata_modal(frame, app);
+    }
 }
 
 fn render_upload_modal(frame: &mut Frame, app: &mut App) {
@@ -2397,6 +2465,49 @@ fn render_resume_modal(frame: &mut Frame, app: &App) {
     frame.render_widget(modal, modal_area);
 }
 
+fn render_turn_metadata_modal(frame: &mut Frame, app: &App) {
+    let TurnMetadataState::Showing {
+        session_name,
+        content,
+    } = &app.turn_metadata_state
+    else {
+        return;
+    };
+
+    let area = frame.area();
+    let modal_width = 92.min(area.width.saturating_sub(4));
+    let modal_height = 24.min(area.height.saturating_sub(4));
+    let modal_area = Rect {
+        x: (area.width - modal_width) / 2,
+        y: (area.height - modal_height) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    frame.render_widget(Clear, modal_area);
+
+    let modal = Paragraph::new(format!(
+        "Session: {}\n\n{}\n\nPress c to copy, any other key to close",
+        truncate_str(session_name, 64),
+        content
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Turn Metadata ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+    )
+    .wrap(Wrap { trim: false })
+    .style(Style::default().fg(Color::White));
+
+    frame.render_widget(modal, modal_area);
+}
+
 fn render_session_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
@@ -2526,13 +2637,13 @@ fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
 
 fn browser_title(session_count: usize, can_resume: bool) -> String {
     let resume = if can_resume { " | R: resume" } else { "" };
-    format!(" Sessions ({session_count}) - Enter: open{resume} | u: share | q: quit ")
+    format!(" Sessions ({session_count}) - Enter: open{resume} | m: metadata | u: share | q: quit ")
 }
 
 fn browser_help_text(can_resume: bool) -> String {
     let resume = if can_resume { " | R: Resume" } else { "" };
     format!(
-        " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search{resume} | u: Share | q: Quit "
+        " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search{resume} | m: Metadata | u: Share | q: Quit "
     )
 }
 
@@ -2540,13 +2651,35 @@ fn viewer_help_text(is_subagent_view: bool, can_resume: bool) -> String {
     let resume = if can_resume { " | R: Resume" } else { "" };
     if is_subagent_view {
         format!(
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy{resume} | Esc: Back | q: Quit "
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy | m: Metadata{resume} | Esc: Back | q: Quit "
         )
     } else {
         format!(
-            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy{resume} | Enter: Open | q: Quit "
+            " ↑/↓: Navigate | ←/→: Tabs | j/k: Scroll | PageUp/PageDown: Fast | /: Search | f: Find Turn | c: Copy | m: Metadata{resume} | Enter: Open | q: Quit "
         )
     }
+}
+
+fn build_turn_metadata_report(session: &Session) -> String {
+    if session.turns.is_empty() {
+        return "No turns in this session.".to_string();
+    }
+
+    let mut out = format!("Turns: {}\n\n", session.turns.len());
+    for (idx, turn) in session.turns.iter().enumerate() {
+        let model = turn.model.as_deref().unwrap_or("-");
+        let effort = turn.thinking_effort.as_deref().unwrap_or("-");
+        let prompt = truncate_str(&turn.user_prompt, 56);
+        let _ = writeln!(
+            out,
+            "{:>3}. model={} | thinking_effort={} | prompt={}",
+            idx + 1,
+            model,
+            effort,
+            prompt
+        );
+    }
+    out
 }
 
 fn format_secret_scan_findings(findings: &[share::SecretScanFinding]) -> String {
@@ -3287,11 +3420,13 @@ fn render_prompt_tab(turn: &Turn) -> Text<'static> {
 
 fn render_thinking_tab(turn: &Turn) -> Text<'static> {
     if let Some(thinking) = &turn.thinking {
+        let heading = if let Some(effort) = &turn.thinking_effort {
+            format!("Model Thinking ({effort}):")
+        } else {
+            "Model Thinking:".to_string()
+        };
         let mut lines = vec![
-            Line::styled(
-                "Model Thinking:".to_string(),
-                Style::default().fg(Color::Magenta).bold(),
-            ),
+            Line::styled(heading, Style::default().fg(Color::Magenta).bold()),
             Line::from(""),
         ];
         // Render thinking as markdown
@@ -4228,6 +4363,7 @@ mod tests {
                     timestamp: None,
                     user_prompt: "check".to_string(),
                     thinking: None,
+                    thinking_effort: None,
                     tool_invocations: Vec::new(),
                     response: "done".to_string(),
                     model: None,
@@ -4318,5 +4454,52 @@ mod tests {
         assert!(!viewer_help_text(true, false).contains("R: Resume"));
         assert!(viewer_help_text(false, true).contains("R: Resume"));
         assert!(viewer_help_text(true, true).contains("R: Resume"));
+    }
+
+    #[test]
+    fn test_help_text_mentions_metadata_shortcut() {
+        assert!(browser_help_text(false).contains("m: Metadata"));
+        assert!(viewer_help_text(false, false).contains("m: Metadata"));
+        assert!(viewer_help_text(true, false).contains("m: Metadata"));
+    }
+
+    #[test]
+    fn test_build_turn_metadata_report_includes_model_and_effort() {
+        let session = Session {
+            id: "s1".to_string(),
+            name: "test".to_string(),
+            source: models::SessionSource::Other {
+                name: "x".to_string(),
+            },
+            project_path: None,
+            turns: vec![
+                Turn {
+                    id: "t1".to_string(),
+                    timestamp: None,
+                    user_prompt: "first prompt".to_string(),
+                    thinking: None,
+                    thinking_effort: Some("high".to_string()),
+                    tool_invocations: Vec::new(),
+                    response: "r1".to_string(),
+                    model: Some("gpt-5.3-codex".to_string()),
+                },
+                Turn {
+                    id: "t2".to_string(),
+                    timestamp: None,
+                    user_prompt: "second prompt".to_string(),
+                    thinking: None,
+                    thinking_effort: None,
+                    tool_invocations: Vec::new(),
+                    response: "r2".to_string(),
+                    model: None,
+                },
+            ],
+        };
+
+        let report = build_turn_metadata_report(&session);
+        assert!(report.contains("model=gpt-5.3-codex"));
+        assert!(report.contains("thinking_effort=high"));
+        assert!(report.contains("model=-"));
+        assert!(report.contains("thinking_effort=-"));
     }
 }

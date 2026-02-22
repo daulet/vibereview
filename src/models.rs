@@ -29,6 +29,7 @@ pub struct Turn {
     pub timestamp: Option<String>,
     pub user_prompt: String,
     pub thinking: Option<String>,
+    pub thinking_effort: Option<String>,
     pub tool_invocations: Vec<ToolInvocation>,
     pub response: String,
     pub model: Option<String>,

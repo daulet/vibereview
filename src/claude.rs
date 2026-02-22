@@ -266,6 +266,7 @@ fn build_turns(
 
         // Collect assistant responses and tool results
         let mut thinking = None;
+        let mut thinking_effort = None;
         let mut response_parts: Vec<String> = Vec::new();
         let mut tool_invocations: Vec<ToolInvocation> = Vec::new();
         let mut model = None;
@@ -307,6 +308,17 @@ fn build_turns(
                         .and_then(|m| m.get("model"))
                         .and_then(|m| m.as_str())
                         .map(String::from);
+                }
+                if thinking_effort.is_none() {
+                    if let Some(message) = next_entry.get("message") {
+                        thinking_effort = extract_claude_thinking_effort(message);
+                    }
+                    if thinking_effort.is_none() {
+                        thinking_effort = next_entry
+                            .get("effortLevel")
+                            .and_then(|e| e.as_str())
+                            .map(String::from);
+                    }
                 }
 
                 // Process assistant message content
@@ -373,6 +385,7 @@ fn build_turns(
                 timestamp,
                 user_prompt,
                 thinking,
+                thinking_effort,
                 tool_invocations,
                 response: response_parts.join("\n\n"),
                 model,
@@ -402,6 +415,35 @@ fn extract_user_prompt(entry: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+fn extract_claude_thinking_effort(message: &Value) -> Option<String> {
+    message
+        .get("effortLevel")
+        .and_then(|e| e.as_str())
+        .map(String::from)
+        .or_else(|| {
+            message
+                .get("thinking")
+                .and_then(|thinking| thinking.get("effort"))
+                .and_then(|e| e.as_str())
+                .map(String::from)
+        })
+        .or_else(|| {
+            message
+                .get("usage")
+                .and_then(|usage| usage.get("reasoning_effort"))
+                .and_then(|e| e.as_str())
+                .map(String::from)
+        })
+        .or_else(|| {
+            message
+                .get("usage")
+                .and_then(|usage| usage.get("thinking"))
+                .and_then(|thinking| thinking.get("effort"))
+                .and_then(|e| e.as_str())
+                .map(String::from)
+        })
 }
 
 fn has_tool_results(entry: &Value) -> bool {
@@ -1502,6 +1544,35 @@ mod tests {
         assert!(turns[0].thinking.is_some());
         assert!(turns[0].thinking.as_ref().unwrap().contains("think about"));
         assert!(turns[0].response.contains("Closures are"));
+    }
+
+    #[test]
+    fn test_build_turns_with_thinking_effort_metadata() {
+        let entries = vec![
+            json!({
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": "Explain ownership"}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "usage": {
+                        "reasoning_effort": "medium"
+                    },
+                    "content": [
+                        {"type": "thinking", "thinking": "Need a concise explanation."},
+                        {"type": "text", "text": "Ownership ensures memory safety without GC."}
+                    ]
+                }
+            }),
+        ];
+
+        let turns = build_turns(&entries, None, None);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].thinking_effort, Some("medium".to_string()));
     }
 
     #[test]
