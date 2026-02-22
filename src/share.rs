@@ -25,7 +25,7 @@ pub const SHARE_KEY_PARAM: &str = "k";
 
 pub const CLOUD_SHARE_API_URL: &str = "https://vibereview.trustme.workers.dev/api/sessions";
 const GITHUB_CLIENT_ID_PATH: &str = "/api/auth/github/client-id";
-const LIST_UPLOADS_PATH: &str = "/api/uploads";
+const LIST_UPLOADS_PATH: &str = "/api/sessions";
 const CLOUD_SHARE_KEY_LEN: usize = 32;
 const CLOUD_SHARE_NONCE_LEN: usize = 12;
 const CLOUD_SHARE_MAGIC: &[u8; 4] = b"VRE1";

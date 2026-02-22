@@ -44,9 +44,9 @@ npm run dev
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/auth/github/client-id` | GET | Returns configured GitHub OAuth client ID |
+| `/api/sessions` | GET | List uploads for authenticated GitHub user (`Authorization` required) |
 | `/api/sessions` | POST | Upload payload (encrypted by default, public optional). Requires `Authorization: Bearer <github_token>`. Returns `{id, url}` |
-| `/api/uploads` | GET | List uploads for authenticated GitHub user (`Authorization` required) |
-| `/api/public-uploads` | GET | List recent public uploads for website home page |
+| `/api/sessions/public` | GET | List recent public uploads for website home page |
 | `/api/sessions/:id` | GET | Get stored payload |
 | `/s/:id` | GET | Web viewer (for encrypted links include key fragment, e.g. `#k=...`) |
 | `/` | GET | Home page listing recent public uploads |

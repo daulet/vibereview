@@ -120,11 +120,11 @@ export default {
       return handleUpload(request, env);
     }
 
-    if (path === '/api/uploads' && request.method === 'GET') {
+    if (path === '/api/sessions' && request.method === 'GET') {
       return handleListUploads(request, env);
     }
 
-    if (path === '/api/public-uploads' && request.method === 'GET') {
+    if (path === '/api/sessions/public' && request.method === 'GET') {
       return handleListPublicUploads(request, env);
     }
 
@@ -764,7 +764,7 @@ function generateHomeHtml(): string {
         Browse sessions that were shared in public mode. Click any item to open it in the viewer.
         Encrypted shares stay private and do not appear on this page.
       </p>
-      <div class="meta">Source: /api/public-uploads</div>
+      <div class="meta">Source: /api/sessions/public</div>
     </section>
 
     <div class="list-head">
@@ -839,7 +839,7 @@ function generateHomeHtml(): string {
 
     async function loadPublicUploads() {
       try {
-        const response = await fetch('/api/public-uploads?limit=80', {
+        const response = await fetch('/api/sessions/public?limit=80', {
           headers: { Accept: 'application/json' }
         });
         if (!response.ok) {
