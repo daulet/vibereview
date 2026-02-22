@@ -91,6 +91,102 @@ impl CloudShareSecurity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareDialogSection {
+    Destination,
+    CloudSecurity,
+    ExportMode,
+}
+
+fn confirming_sections(cloud_available: bool, target: ShareTarget) -> Vec<ShareDialogSection> {
+    if !cloud_available {
+        return vec![ShareDialogSection::ExportMode];
+    }
+    match target {
+        ShareTarget::Cloud => vec![
+            ShareDialogSection::Destination,
+            ShareDialogSection::CloudSecurity,
+        ],
+        ShareTarget::File => vec![
+            ShareDialogSection::Destination,
+            ShareDialogSection::ExportMode,
+        ],
+    }
+}
+
+fn normalize_confirming_focus(
+    focus: ShareDialogSection,
+    cloud_available: bool,
+    target: ShareTarget,
+) -> ShareDialogSection {
+    let sections = confirming_sections(cloud_available, target);
+    if sections.contains(&focus) {
+        focus
+    } else {
+        sections[0]
+    }
+}
+
+fn move_confirming_focus(
+    focus: ShareDialogSection,
+    cloud_available: bool,
+    target: ShareTarget,
+    forward: bool,
+) -> ShareDialogSection {
+    let sections = confirming_sections(cloud_available, target);
+    let current = sections.iter().position(|s| *s == focus).unwrap_or(0);
+    let next = if forward {
+        (current + 1) % sections.len()
+    } else {
+        (current + sections.len() - 1) % sections.len()
+    };
+    sections[next]
+}
+
+fn adjust_confirming_selection(
+    target: &mut ShareTarget,
+    mode: &mut share::ShareExportMode,
+    cloud_security: &mut CloudShareSecurity,
+    focus: ShareDialogSection,
+    cloud_available: bool,
+    forward: bool,
+) {
+    match focus {
+        ShareDialogSection::Destination => {
+            if cloud_available {
+                *target = match *target {
+                    ShareTarget::Cloud => ShareTarget::File,
+                    ShareTarget::File => ShareTarget::Cloud,
+                };
+            }
+        }
+        ShareDialogSection::CloudSecurity => {
+            *cloud_security = match *cloud_security {
+                CloudShareSecurity::Encrypted => CloudShareSecurity::Public,
+                CloudShareSecurity::Public => CloudShareSecurity::Encrypted,
+            };
+        }
+        ShareDialogSection::ExportMode => {
+            const MODES: [share::ShareExportMode; 3] = [
+                share::ShareExportMode::PromptResponseOnly,
+                share::ShareExportMode::PromptResponseAndDiff,
+                share::ShareExportMode::FullSession,
+            ];
+            let current = MODES.iter().position(|m| *m == *mode).unwrap_or(0);
+            let next = if forward {
+                (current + 1) % MODES.len()
+            } else {
+                (current + MODES.len() - 1) % MODES.len()
+            };
+            *mode = MODES[next];
+        }
+    }
+}
+
+fn default_confirming_focus(cloud_available: bool, target: ShareTarget) -> ShareDialogSection {
+    confirming_sections(cloud_available, target)[0]
+}
+
 /// State of the upload operation
 #[derive(Debug, Clone)]
 pub enum UploadState {
@@ -100,6 +196,7 @@ pub enum UploadState {
         mode: share::ShareExportMode,
         cloud_api_url: Option<String>,
         cloud_security: CloudShareSecurity,
+        focus: ShareDialogSection,
     },
     Compressing {
         target: ShareTarget,
@@ -718,10 +815,14 @@ impl App {
                 mut mode,
                 cloud_api_url,
                 mut cloud_security,
+                mut focus,
             } => {
+                let cloud_available = cloud_api_url.is_some();
+                focus = normalize_confirming_focus(focus, cloud_available, target);
+
                 match key {
                     KeyCode::Char('c') => {
-                        if cloud_api_url.is_some() {
+                        if cloud_available {
                             target = ShareTarget::Cloud;
                         }
                     }
@@ -731,6 +832,32 @@ impl App {
                     KeyCode::Char('3') => mode = share::ShareExportMode::FullSession,
                     KeyCode::Char('e') => cloud_security = CloudShareSecurity::Encrypted,
                     KeyCode::Char('p') => cloud_security = CloudShareSecurity::Public,
+                    KeyCode::Tab => {
+                        focus = move_confirming_focus(focus, cloud_available, target, true);
+                    }
+                    KeyCode::BackTab => {
+                        focus = move_confirming_focus(focus, cloud_available, target, false);
+                    }
+                    KeyCode::Left | KeyCode::Up => {
+                        adjust_confirming_selection(
+                            &mut target,
+                            &mut mode,
+                            &mut cloud_security,
+                            focus,
+                            cloud_available,
+                            false,
+                        );
+                    }
+                    KeyCode::Right | KeyCode::Down => {
+                        adjust_confirming_selection(
+                            &mut target,
+                            &mut mode,
+                            &mut cloud_security,
+                            focus,
+                            cloud_available,
+                            true,
+                        );
+                    }
                     KeyCode::Enter | KeyCode::Char('y') => {
                         self.perform_upload(target, mode, cloud_api_url.as_deref(), cloud_security);
                         return;
@@ -741,11 +868,14 @@ impl App {
                     }
                     _ => {}
                 }
+
+                focus = normalize_confirming_focus(focus, cloud_available, target);
                 self.upload_state = UploadState::Confirming {
                     target,
                     mode,
                     cloud_api_url,
                     cloud_security,
+                    focus,
                 };
             }
             UploadState::Complete { .. } | UploadState::Error { .. } => {
@@ -945,15 +1075,18 @@ impl App {
                 // Share selected session
                 if self.session_list_state.selected().is_some() {
                     let cloud_api_url = share::cloud_share_api_url();
+                    let cloud_available = cloud_api_url.is_some();
+                    let target = if cloud_available {
+                        ShareTarget::Cloud
+                    } else {
+                        ShareTarget::File
+                    };
                     self.upload_state = UploadState::Confirming {
-                        target: if cloud_api_url.is_some() {
-                            ShareTarget::Cloud
-                        } else {
-                            ShareTarget::File
-                        },
+                        target,
                         mode: share::ShareExportMode::FullSession,
                         cloud_api_url,
                         cloud_security: CloudShareSecurity::Encrypted,
+                        focus: default_confirming_focus(cloud_available, target),
                     };
                 }
             }
@@ -1017,15 +1150,18 @@ impl App {
                 // Share current session
                 if self.session.is_some() {
                     let cloud_api_url = share::cloud_share_api_url();
+                    let cloud_available = cloud_api_url.is_some();
+                    let target = if cloud_available {
+                        ShareTarget::Cloud
+                    } else {
+                        ShareTarget::File
+                    };
                     self.upload_state = UploadState::Confirming {
-                        target: if cloud_api_url.is_some() {
-                            ShareTarget::Cloud
-                        } else {
-                            ShareTarget::File
-                        },
+                        target,
                         mode: share::ShareExportMode::FullSession,
                         cloud_api_url,
                         cloud_security: CloudShareSecurity::Encrypted,
+                        focus: default_confirming_focus(cloud_available, target),
                     };
                 }
             }
@@ -1670,7 +1806,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
 
     // Create centered modal area
     let modal_width = 72.min(area.width.saturating_sub(4));
-    let modal_height = 18.min(area.height.saturating_sub(4));
+    let modal_height = 22.min(area.height.saturating_sub(4));
     let modal_area = Rect {
         x: (area.width - modal_width) / 2,
         y: (area.height - modal_height) / 2,
@@ -1688,6 +1824,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
             mode,
             cloud_api_url,
             cloud_security,
+            focus,
         } => {
             let session_name = app
                 .session
@@ -1700,6 +1837,14 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                         .map(|s| s.name.clone())
                 })
                 .unwrap_or_else(|| "Unknown".to_string());
+            let section_marker = |section: ShareDialogSection| {
+                if *focus == section {
+                    ">"
+                } else {
+                    " "
+                }
+            };
+            let radio = |selected: bool| if selected { "[x]" } else { "[ ]" };
             let content = if cloud_api_url.is_some() {
                 if *target == ShareTarget::Cloud {
                     let key_note = match cloud_security {
@@ -1715,20 +1860,23 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                     };
                     format!(
                         "Share \"{}\".\n\n\
-                        Destination:\n\
-                          c) Cloud link\n\
-                          f) File export\n\n\
-                        Selected destination: {}\n\n\
-                        Cloud security:\n\
-                          e) Encrypted (recommended)\n\
-                          p) Public (not encrypted)\n\n\
-                        Selected security: {}\n\
+                        {} Destination:\n\
+                          {} Cloud link\n\
+                          {} File export\n\n\
+                        {} Security:\n\
+                          {} Encrypted (recommended)\n\
+                          {} Public (not encrypted)\n\n\
                         {}\n\n\
-                        Press Enter or 'y' to upload full session,\n\
-                        Esc or 'n' to cancel",
+                        Tab/Shift+Tab: next/prev section\n\
+                        Arrows: change selected radio\n\
+                        Enter or 'y': share | Esc or 'n': cancel",
                         truncate_str(&session_name, 36),
-                        target.label(),
-                        cloud_security.label(),
+                        section_marker(ShareDialogSection::Destination),
+                        radio(*target == ShareTarget::Cloud),
+                        radio(*target == ShareTarget::File),
+                        section_marker(ShareDialogSection::CloudSecurity),
+                        radio(*cloud_security == CloudShareSecurity::Encrypted),
+                        radio(*cloud_security == CloudShareSecurity::Public),
                         key_note,
                     )
                 } else {
@@ -1739,20 +1887,25 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                     };
                     format!(
                         "Share \"{}\".\n\n\
-                        Destination:\n\
-                          c) Cloud link\n\
-                          f) File export\n\n\
-                        Selected destination: {}\n\n\
-                        Choose export mode:\n\
-                          1) Prompt + response only\n\
-                          2) Prompt + response + diff\n\
-                          3) Full session (resumable)\n\n\
-                        Selected mode: {}\n\
+                        {} Destination:\n\
+                          {} Cloud link\n\
+                          {} File export\n\n\
+                        {} Export mode:\n\
+                          {} Prompt + response only\n\
+                          {} Prompt + response + diff\n\
+                          {} Full session (resumable)\n\n\
                         Resumable on another machine: {}\n\n\
-                        Press Enter or 'y' to export, Esc or 'n' to cancel",
+                        Tab/Shift+Tab: next/prev section\n\
+                        Arrows: change selected radio\n\
+                        Enter or 'y': export | Esc or 'n': cancel",
                         truncate_str(&session_name, 36),
-                        target.label(),
-                        mode.label(),
+                        section_marker(ShareDialogSection::Destination),
+                        radio(*target == ShareTarget::Cloud),
+                        radio(*target == ShareTarget::File),
+                        section_marker(ShareDialogSection::ExportMode),
+                        radio(*mode == share::ShareExportMode::PromptResponseOnly),
+                        radio(*mode == share::ShareExportMode::PromptResponseAndDiff),
+                        radio(*mode == share::ShareExportMode::FullSession),
                         resumable_hint
                     )
                 }
@@ -1767,16 +1920,19 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                     Cloud share is not configured.\n\
                     Set {} to enable cloud links.\n\
                     Falling back to file export.\n\n\
-                    Choose export mode:\n\
-                      1) Prompt + response only\n\
-                      2) Prompt + response + diff\n\
-                      3) Full session (resumable)\n\n\
-                    Selected mode: {}\n\
+                    {} Export mode:\n\
+                      {} Prompt + response only\n\
+                      {} Prompt + response + diff\n\
+                      {} Full session (resumable)\n\n\
                     Resumable on another machine: {}\n\n\
-                    Press Enter or 'y' to export, Esc or 'n' to cancel",
+                    Arrows: change selected radio\n\
+                    Enter or 'y': export | Esc or 'n': cancel",
                     truncate_str(&session_name, 36),
                     share::SHARE_API_URL_ENV,
-                    mode.label(),
+                    section_marker(ShareDialogSection::ExportMode),
+                    radio(*mode == share::ShareExportMode::PromptResponseOnly),
+                    radio(*mode == share::ShareExportMode::PromptResponseAndDiff),
+                    radio(*mode == share::ShareExportMode::FullSession),
                     resumable_hint
                 )
             };
