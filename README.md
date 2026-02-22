@@ -16,5 +16,7 @@ Harness for your AI harness. Browse Codex, Claude Code turns/tools/diffs, resume
 - Share session as a file or as an encrypted cloud link;
 - Import shared session from a file or cloud share URL;
 
-Cloud links include a decryption key in URL fragment (`#k=...`). Keep the full URL to share or import via:
+Cloud links default to encrypted and include a decryption key in URL fragment (`#k=...`).
+You can optionally switch to a public (unencrypted) cloud link in the share dialog.
+Keep the full URL to share or import via:
 `vibereview import "<share-url>"`.

@@ -1,7 +1,8 @@
 # VibeReview Worker
 
 Cloudflare Worker for session sharing. Handles upload, storage (R2), and web viewer.
-New shares are encrypted client-side; the worker stores ciphertext only.
+New shares are encrypted client-side by default (with optional public mode);
+the worker stores whatever payload the client uploads.
 
 ## Setup
 
@@ -30,9 +31,9 @@ npm run dev
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/sessions` | POST | Upload encrypted payload (ciphertext blob). Returns `{id, url}` |
-| `/api/sessions/:id` | GET | Get stored payload (encrypted for new shares) |
-| `/s/:id` | GET | Web viewer (expects key in URL fragment, e.g. `#k=...`) |
+| `/api/sessions` | POST | Upload payload (encrypted by default, public optional). Returns `{id, url}` |
+| `/api/sessions/:id` | GET | Get stored payload |
+| `/s/:id` | GET | Web viewer (for encrypted links include key fragment, e.g. `#k=...`) |
 
 ## Rate Limits
 

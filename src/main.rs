@@ -75,6 +75,22 @@ impl ShareTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudShareSecurity {
+    Encrypted,
+    Public,
+}
+
+impl CloudShareSecurity {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Encrypted => "Encrypted (recommended)",
+            Self::Public => "Public (not encrypted)",
+        }
+    }
+}
+
 /// State of the upload operation
 #[derive(Debug, Clone)]
 pub enum UploadState {
@@ -83,6 +99,7 @@ pub enum UploadState {
         target: ShareTarget,
         mode: share::ShareExportMode,
         cloud_api_url: Option<String>,
+        cloud_security: CloudShareSecurity,
     },
     Compressing {
         target: ShareTarget,
@@ -94,6 +111,7 @@ pub enum UploadState {
         target: ShareTarget,
         location: String,
         resumable: bool,
+        cloud_security: Option<CloudShareSecurity>,
     },
     Error {
         message: String,
@@ -699,6 +717,7 @@ impl App {
                 mut target,
                 mut mode,
                 cloud_api_url,
+                mut cloud_security,
             } => {
                 match key {
                     KeyCode::Char('c') => {
@@ -710,8 +729,10 @@ impl App {
                     KeyCode::Char('1') => mode = share::ShareExportMode::PromptResponseOnly,
                     KeyCode::Char('2') => mode = share::ShareExportMode::PromptResponseAndDiff,
                     KeyCode::Char('3') => mode = share::ShareExportMode::FullSession,
+                    KeyCode::Char('e') => cloud_security = CloudShareSecurity::Encrypted,
+                    KeyCode::Char('p') => cloud_security = CloudShareSecurity::Public,
                     KeyCode::Enter | KeyCode::Char('y') => {
-                        self.perform_upload(target, mode, cloud_api_url.as_deref());
+                        self.perform_upload(target, mode, cloud_api_url.as_deref(), cloud_security);
                         return;
                     }
                     KeyCode::Esc | KeyCode::Char('n') => {
@@ -724,6 +745,7 @@ impl App {
                     target,
                     mode,
                     cloud_api_url,
+                    cloud_security,
                 };
             }
             UploadState::Complete { .. } | UploadState::Error { .. } => {
@@ -763,6 +785,7 @@ impl App {
         target: ShareTarget,
         mode: share::ShareExportMode,
         cloud_api_url: Option<&str>,
+        cloud_security: CloudShareSecurity,
     ) {
         let selected_session = self.selected_unified_session().cloned().or_else(|| {
             self.current_session_index
@@ -813,27 +836,39 @@ impl App {
                     }
                 };
 
-                let key = share::generate_cloud_share_key();
-                let payload = match share::encrypt_cloud_payload(&compressed, &key) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        self.upload_state = UploadState::Error {
-                            message: format!("Encryption failed: {e}"),
+                let mut share_key = None;
+                let payload = match cloud_security {
+                    CloudShareSecurity::Encrypted => {
+                        let key = share::generate_cloud_share_key();
+                        let payload = match share::encrypt_cloud_payload(&compressed, &key) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                self.upload_state = UploadState::Error {
+                                    message: format!("Encryption failed: {e}"),
+                                };
+                                return;
+                            }
                         };
-                        return;
+                        share_key = Some(key);
+                        payload
                     }
+                    CloudShareSecurity::Public => compressed,
                 };
 
                 self.upload_state = UploadState::Uploading { target };
 
                 match share::upload_session(&payload, api_url) {
                     Ok(response) => {
-                        let share_url = share::attach_key_to_share_url(&response.url, &key);
+                        let share_url = match share_key {
+                            Some(key) => share::attach_key_to_share_url(&response.url, &key),
+                            None => response.url,
+                        };
                         let _ = share::copy_to_clipboard(&share_url);
                         self.upload_state = UploadState::Complete {
                             target,
                             location: share_url,
                             resumable: false,
+                            cloud_security: Some(cloud_security),
                         };
                     }
                     Err(e) => {
@@ -881,6 +916,7 @@ impl App {
                             target,
                             location: path_str,
                             resumable: mode.is_resumable(),
+                            cloud_security: None,
                         };
                     }
                     Err(e) => {
@@ -917,6 +953,7 @@ impl App {
                         },
                         mode: share::ShareExportMode::FullSession,
                         cloud_api_url,
+                        cloud_security: CloudShareSecurity::Encrypted,
                     };
                 }
             }
@@ -988,6 +1025,7 @@ impl App {
                         },
                         mode: share::ShareExportMode::FullSession,
                         cloud_api_url,
+                        cloud_security: CloudShareSecurity::Encrypted,
                     };
                 }
             }
@@ -1649,6 +1687,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
             target,
             mode,
             cloud_api_url,
+            cloud_security,
         } => {
             let session_name = app
                 .session
@@ -1663,20 +1702,34 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
                 .unwrap_or_else(|| "Unknown".to_string());
             let content = if cloud_api_url.is_some() {
                 if *target == ShareTarget::Cloud {
+                    let key_note = match cloud_security {
+                        CloudShareSecurity::Encrypted => format!(
+                            "Encrypted link uploads ciphertext.\n\
+                            Key is appended as '#{}=...'.\n\
+                            Share full URL for access.",
+                            share::SHARE_KEY_PARAM
+                        ),
+                        CloudShareSecurity::Public => "Public link uploads readable payload.\n\
+                            No key required to view/import."
+                            .to_string(),
+                    };
                     format!(
                         "Share \"{}\".\n\n\
                         Destination:\n\
                           c) Cloud link\n\
                           f) File export\n\n\
                         Selected destination: {}\n\n\
-                        Cloud link uploads an encrypted payload.\n\
-                        Decryption key is appended as '#{}=...'.\n\
-                        Anyone with full URL can view/import.\n\n\
+                        Cloud security:\n\
+                          e) Encrypted (recommended)\n\
+                          p) Public (not encrypted)\n\n\
+                        Selected security: {}\n\
+                        {}\n\n\
                         Press Enter or 'y' to upload full session,\n\
                         Esc or 'n' to cancel",
                         truncate_str(&session_name, 36),
                         target.label(),
-                        share::SHARE_KEY_PARAM,
+                        cloud_security.label(),
+                        key_note,
                     )
                 } else {
                     let resumable_hint = if mode.is_resumable() {
@@ -1736,7 +1789,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
         UploadState::Compressing { target } => match target {
             ShareTarget::Cloud => (
                 " Sharing... ",
-                "Compressing and encrypting session...".to_string(),
+                "Preparing cloud payload...".to_string(),
                 Style::default().fg(Color::Cyan),
             ),
             ShareTarget::File => (
@@ -1748,7 +1801,7 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
         UploadState::Uploading { target } => match target {
             ShareTarget::Cloud => (
                 " Sharing... ",
-                "Uploading encrypted payload...".to_string(),
+                "Uploading cloud payload...".to_string(),
                 Style::default().fg(Color::Cyan),
             ),
             ShareTarget::File => (
@@ -1761,23 +1814,41 @@ fn render_upload_modal(frame: &mut Frame, app: &App) {
             target,
             location,
             resumable,
+            cloud_security,
         } => match target {
-            ShareTarget::Cloud => (
-                " Share Complete ",
-                format!(
-                    "Session shared successfully!\n\n\
-                    URL: {location}\n\n\
-                    Includes decryption key in '#{}=...'.\n\
-                    Keep the full URL when sharing.\n\
-                    (Copied to clipboard)\n\n\
-                    To open locally via CLI:\n\
-                    {}\n\n\
-                    Press any key to close",
-                    share::SHARE_KEY_PARAM,
-                    share_import_command(location),
-                ),
-                Style::default().fg(Color::Green),
-            ),
+            ShareTarget::Cloud => {
+                let security = cloud_security.unwrap_or(CloudShareSecurity::Encrypted);
+                let security_text = match security {
+                    CloudShareSecurity::Encrypted => format!(
+                        "Security: {}\n\
+                        Includes decryption key in '#{}=...'.\n\
+                        Keep the full URL when sharing.",
+                        security.label(),
+                        share::SHARE_KEY_PARAM
+                    ),
+                    CloudShareSecurity::Public => {
+                        format!(
+                            "Security: {}\nNo decryption key required.",
+                            security.label()
+                        )
+                    }
+                };
+                (
+                    " Share Complete ",
+                    format!(
+                        "Session shared successfully!\n\n\
+                        URL: {location}\n\n\
+                        {}\n\
+                        (Copied to clipboard)\n\n\
+                        To open locally via CLI:\n\
+                        {}\n\n\
+                        Press any key to close",
+                        security_text,
+                        share_import_command(location),
+                    ),
+                    Style::default().fg(Color::Green),
+                )
+            }
             ShareTarget::File => (
                 " Export Complete ",
                 format!(

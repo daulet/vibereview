@@ -324,7 +324,9 @@ pub fn parse_cloud_share_locator(input: &str) -> Result<CloudShareLocator> {
 
 pub fn fetch_shared_session_from_cloud_link(link: &str) -> Result<SharedSession> {
     let locator = parse_cloud_share_locator(link)?;
-    let payload = download_cloud_payload(&locator.api_url)?;
+    let payload = download_cloud_payload(&locator.api_url).map_err(|e| {
+        color_eyre::eyre::eyre!("Failed to download shared session {}: {e}", locator.id)
+    })?;
     let compressed = decode_cloud_payload(&payload, locator.key.as_deref())?;
     decompress_session(&compressed)
 }
