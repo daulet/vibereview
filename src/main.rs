@@ -6,7 +6,7 @@ mod share;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use color_eyre::{eyre::eyre, Result};
 use crossterm::{
@@ -41,6 +41,8 @@ const SEARCH_HIGHLIGHT_BG: Color = Color::Indexed(238);
 const SEARCH_CURRENT_BG: Color = Color::Yellow;
 /// Foreground color for the current/active search match
 const SEARCH_CURRENT_FG: Color = Color::Black;
+const COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1500);
+const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 enum CliCommand {
@@ -747,6 +749,26 @@ impl App {
             .map(|c| c.title.as_str())
             .collect::<Vec<_>>()
             .join(" > ")
+    }
+
+    #[must_use]
+    fn next_timer_deadline(&self) -> Option<Instant> {
+        self.copy_feedback
+            .as_ref()
+            .map(|f| f.timestamp + COPY_FEEDBACK_DURATION)
+    }
+
+    fn process_timers(&mut self) -> bool {
+        let mut changed = false;
+        if self
+            .copy_feedback
+            .as_ref()
+            .is_some_and(|f| f.timestamp.elapsed() >= COPY_FEEDBACK_DURATION)
+        {
+            self.copy_feedback = None;
+            changed = true;
+        }
+        changed
     }
 
     fn select_next_in_list(state: &mut ListState, len: usize) {
@@ -2442,7 +2464,7 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
     let copy_feedback = app
         .copy_feedback
         .as_ref()
-        .filter(|f| f.timestamp.elapsed().as_millis() < 1500);
+        .filter(|f| f.timestamp.elapsed() < COPY_FEEDBACK_DURATION);
 
     let (help_text, help_style) = if let Some(feedback) = copy_feedback {
         (
@@ -3248,21 +3270,38 @@ fn main() -> Result<()> {
         None => App::new(),
     };
 
-    while !app.should_quit {
-        terminal.draw(|frame| ui(frame, &mut app))?;
+    let mut needs_redraw = true;
 
-        if event::poll(std::time::Duration::from_millis(16))? {
+    while !app.should_quit {
+        if needs_redraw {
+            terminal.draw(|frame| ui(frame, &mut app))?;
+            needs_redraw = false;
+        }
+
+        let timeout = app
+            .next_timer_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(IDLE_POLL_TIMEOUT);
+
+        if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
                         app.handle_key(key.code);
+                        needs_redraw = true;
                     }
                 }
                 Event::Mouse(mouse) => {
                     app.handle_mouse(mouse);
+                    needs_redraw = true;
+                }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
                 }
                 _ => {}
             }
+        } else if app.process_timers() {
+            needs_redraw = true;
         }
     }
 
