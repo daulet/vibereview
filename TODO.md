@@ -9,7 +9,7 @@
 
 # Bugs
 
-- [ ] text selection is broken - selects wrong rows
+- [x] text selection is broken - selects wrong rows
 - [ ] Add links to github
 - [ ] Make friendlier readme with install and privacy explanations
 - [ ] Defend against malicious upload

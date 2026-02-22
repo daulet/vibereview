@@ -1884,6 +1884,7 @@ impl App {
                         }
                     }
                 }
+                self.text_selection = None;
             }
             MouseEventKind::ScrollUp => {
                 if in_content {
@@ -2304,6 +2305,20 @@ fn wrap_text_for_selection(text: &str, width: u16) -> Vec<String> {
     }
 
     wrapped
+}
+
+fn text_to_plain_string(content: &Text<'_>) -> String {
+    content
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_resume_modal(frame: &mut Frame, app: &App) {
@@ -2779,36 +2794,35 @@ fn render_detail_panel(frame: &mut Frame, app: &mut App, area: Rect) {
             DetailTab::Diff => render_diff_tab(turn),
         };
 
-        // Extract plain text lines for selection
-        let content_lines: Vec<String> = content
-            .lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect();
-
-        // Apply selection highlighting if active
         let content = apply_search_highlight(content, app.search.as_ref(), ctx.active_tab);
-        let content = apply_selection_highlight(
-            content,
+        let content_plain = text_to_plain_string(&content);
+        let wrapped_lines = wrap_text_for_selection(&content_plain, inner_content_area.width);
+        let selection_active = app.text_selection.is_some();
+
+        let render_content = if selection_active {
+            Text::from(wrapped_lines.join("\n"))
+        } else {
+            content
+        };
+
+        let render_content = apply_selection_highlight(
+            render_content,
             app.text_selection.as_ref(),
             ctx.scroll_offset,
             inner_content_area.width,
         );
 
-        let paragraph = Paragraph::new(content)
+        let mut paragraph = Paragraph::new(render_content)
             .block(content_block)
-            .wrap(Wrap { trim: false })
             .scroll((ctx.scroll_offset, 0));
+        if !selection_active {
+            paragraph = paragraph.wrap(Wrap { trim: false });
+        }
         frame.render_widget(paragraph, content_area);
 
         // Store for mouse handling (after we're done with ctx borrow)
         app.content_area = Some(inner_content_area);
-        app.content_lines = content_lines;
+        app.content_lines = wrapped_lines;
         app.selection_scroll_offset = scroll_offset;
     } else {
         let paragraph = Paragraph::new("Select a turn to view details")
