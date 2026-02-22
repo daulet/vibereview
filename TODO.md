@@ -4,7 +4,7 @@
 - [ ] do we need to resume in worktree? see what codex new app did
 - [ ] Fork discussion, capture unstaged changes for it to work properly, eg with hooks
 - [ ] Similar options to share only prompt when uploading to cloud
-- [ ] Scan for secrets in sessions
+- [x] Scan for secrets in sessions
 - [ ] List model used, thinking mode
 
 # Bugs
