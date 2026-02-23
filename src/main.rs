@@ -31,7 +31,7 @@ use ratatui::{
 
 use claude::{list_projects, list_sessions, parse_session};
 use codex::{list_codex_projects, list_codex_sessions_for_project, parse_codex_session};
-use models::{Session, ToolInvocation, ToolType, Turn};
+use models::{Session, SessionSource, ToolInvocation, ToolType, Turn};
 
 // =============================================================================
 // Constants
@@ -2760,6 +2760,8 @@ fn run_cloud_upload_job(
         CloudShareSecurity::Encrypted => "encrypted",
         CloudShareSecurity::Public => "public",
     };
+    let session_model = primary_session_model(&pending.session);
+    let session_agent = session_agent_label(&pending.session);
 
     let mut share_key = None;
     let payload = match pending.cloud_security {
@@ -2783,6 +2785,8 @@ fn run_cloud_upload_job(
         &fingerprint,
         &pending.session.name,
         pending.session.turns.len(),
+        session_model.as_deref(),
+        session_agent.as_deref(),
         security,
     )
     .map_err(|e| format!("Upload failed: {e}"))?;
@@ -2798,6 +2802,33 @@ fn run_cloud_upload_job(
         cloud_security: pending.cloud_security,
         reused: response.reused,
     })
+}
+
+fn primary_session_model(session: &Session) -> Option<String> {
+    session
+        .turns
+        .iter()
+        .rev()
+        .filter_map(|turn| turn.model.as_deref())
+        .map(str::trim)
+        .find(|model| !model.is_empty())
+        .map(String::from)
+}
+
+fn session_agent_label(session: &Session) -> Option<String> {
+    match &session.source {
+        SessionSource::ClaudeCode { .. } => Some("Claude Code".to_string()),
+        SessionSource::Other { name } => {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                None
+            } else if trimmed.to_ascii_lowercase().contains("codex") {
+                Some("Codex".to_string())
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+    }
 }
 
 fn render_session_viewer(frame: &mut Frame, app: &mut App) {

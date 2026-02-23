@@ -12,6 +12,7 @@
 # Bugs
 
 - [ ] Speed up launch
+- [ ] Share from in session view too
 - [x] text selection is broken - selects wrong rows
 - [ ] Add links to github
 - [ ] Make friendlier readme with install and privacy explanations

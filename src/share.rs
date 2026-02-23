@@ -1249,6 +1249,8 @@ pub fn upload_session(
     fingerprint: &str,
     session_name: &str,
     turn_count: usize,
+    session_model: Option<&str>,
+    session_agent: Option<&str>,
     security: &str,
 ) -> Result<UploadResponse> {
     let client = reqwest::blocking::Client::new();
@@ -1262,17 +1264,48 @@ pub fn upload_session(
             }
         })
         .collect();
+    let safe_session_model = session_model.map(|model| {
+        model
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii() && ch != '\n' && ch != '\r' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    });
+    let safe_session_agent = session_agent.map(|agent| {
+        agent
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii() && ch != '\n' && ch != '\r' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    });
 
-    let response = client
+    let mut request = client
         .post(api_url)
         .header("Content-Type", "application/octet-stream")
         .bearer_auth(auth_token)
         .header("X-Session-Fingerprint", fingerprint)
         .header("X-Session-Name", safe_session_name)
         .header("X-Session-Turn-Count", turn_count.to_string())
-        .header("X-Share-Security", security)
-        .body(payload.to_vec())
-        .send()?;
+        .header("X-Share-Security", security);
+
+    if let Some(model) = safe_session_model {
+        request = request.header("X-Session-Model", model);
+    }
+    if let Some(agent) = safe_session_agent {
+        request = request.header("X-Session-Agent", agent);
+    }
+
+    let response = request.body(payload.to_vec()).send()?;
 
     if !response.status().is_success() {
         let status = response.status();

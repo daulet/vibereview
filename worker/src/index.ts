@@ -31,6 +31,8 @@ interface UploadRecord {
   security: 'encrypted' | 'public';
   session_name?: string;
   turn_count?: number;
+  session_model?: string;
+  session_agent?: string;
   uploaded_at: string;
 }
 
@@ -44,6 +46,8 @@ interface PublicUploadRecord {
   uploaded_at: string;
   session_name?: string;
   turn_count?: number;
+  session_model?: string;
+  session_agent?: string;
   owner_login?: string;
 }
 
@@ -214,7 +218,7 @@ function corsHeaders(): HeadersInit {
     'Access-Control-Allow-Origin': CORS_ALLOWED_ORIGIN,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers':
-      'Content-Type, Authorization, X-Session-Fingerprint, X-Session-Name, X-Session-Turn-Count, X-Share-Security',
+      'Content-Type, Authorization, X-Session-Fingerprint, X-Session-Name, X-Session-Turn-Count, X-Session-Model, X-Session-Agent, X-Share-Security',
     Vary: 'Origin',
   };
 }
@@ -524,18 +528,39 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     typeof turnCount === 'number' && Number.isFinite(turnCount) && turnCount >= 0
       ? turnCount
       : undefined;
+  const sessionModelRaw = request.headers.get('X-Session-Model')?.trim();
+  const sessionModel = sessionModelRaw ? sessionModelRaw.slice(0, 120) : undefined;
+  const sessionAgentRaw = request.headers.get('X-Session-Agent')?.trim();
+  const sessionAgent = sessionAgentRaw ? sessionAgentRaw.slice(0, 120) : undefined;
 
   const index = await loadUserIndex(env, authResult.id);
-  const existing = index.uploads.find(
+  const existingIndex = index.uploads.findIndex(
     (item) => item.fingerprint === fingerprint && item.security === security
   );
+  const existing = existingIndex >= 0 ? index.uploads[existingIndex] : undefined;
   if (existing) {
+    const needsModelUpdate = !existing.session_model && !!sessionModel;
+    const needsAgentUpdate = !existing.session_agent && !!sessionAgent;
+
+    if (needsModelUpdate) {
+      existing.session_model = sessionModel;
+    }
+    if (needsAgentUpdate) {
+      existing.session_agent = sessionAgent;
+    }
+    if (needsModelUpdate || needsAgentUpdate) {
+      index.uploads[existingIndex] = existing;
+      await saveUserIndex(env, authResult.id, index);
+    }
+
     if (security === 'public') {
       await upsertPublicUpload(env, {
         id: existing.id,
         uploaded_at: existing.uploaded_at,
         session_name: existing.session_name,
         turn_count: existing.turn_count,
+        session_model: existing.session_model ?? sessionModel,
+        session_agent: existing.session_agent ?? sessionAgent,
         owner_login: authResult.login,
       });
     }
@@ -608,6 +633,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       fingerprint,
       security,
       turnCount: normalizedTurnCount?.toString() ?? '',
+      sessionModel: sessionModel ?? '',
+      sessionAgent: sessionAgent ?? '',
       sessionName: sessionName ?? '',
     },
   });
@@ -618,6 +645,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     security,
     session_name: sessionName,
     turn_count: normalizedTurnCount,
+    session_model: sessionModel,
+    session_agent: sessionAgent,
     uploaded_at: uploadedAt,
   };
   index.uploads.unshift(newRecord);
@@ -630,6 +659,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       uploaded_at: uploadedAt,
       session_name: sessionName,
       turn_count: normalizedTurnCount,
+      session_model: sessionModel,
+      session_agent: sessionAgent,
       owner_login: authResult.login,
     });
   }
@@ -862,6 +893,13 @@ function generateHomeHtml(): string {
       font: 500 12px/1.4 'IBM Plex Mono', monospace;
     }
 
+    .upload-model {
+      margin: 0 0 6px;
+      color: #285149;
+      font: 600 12px/1.35 'IBM Plex Mono', monospace;
+      word-break: break-word;
+    }
+
     .empty {
       border: 1px dashed #b8cbc3;
       border-radius: 14px;
@@ -924,9 +962,12 @@ function generateHomeHtml(): string {
     <section id="uploads" class="uploads" aria-live="polite"></section>
   </main>
 
-  <script>
+  <script type="module">
+    import { decompress } from 'https://esm.sh/fzstd@0.1.1';
+
     const statusEl = document.getElementById('status');
     const uploadsEl = document.getElementById('uploads');
+    const sessionSummaryCache = new Map();
 
     function formatDate(isoValue) {
       const date = new Date(isoValue);
@@ -949,6 +990,90 @@ function generateHomeHtml(): string {
       }
       parts.push(formatDate(item.uploaded_at));
       return parts.join(' · ');
+    }
+
+    function normalizeAgentName(source) {
+      if (!source || typeof source !== 'object') {
+        return null;
+      }
+      if (source.ClaudeCode) {
+        return 'Claude Code';
+      }
+      const otherName = source.Other && typeof source.Other.name === 'string'
+        ? source.Other.name.trim()
+        : '';
+      if (!otherName) {
+        return null;
+      }
+      if (otherName.toLowerCase().includes('codex')) {
+        return 'Codex';
+      }
+      return otherName;
+    }
+
+    function primaryModelFromTurns(turns) {
+      if (!Array.isArray(turns)) {
+        return null;
+      }
+      for (let i = turns.length - 1; i >= 0; i--) {
+        const candidate = typeof turns[i]?.model === 'string' ? turns[i].model.trim() : '';
+        if (candidate) {
+          return candidate;
+        }
+      }
+      return null;
+    }
+
+    async function fetchSessionSummary(id) {
+      if (sessionSummaryCache.has(id)) {
+        return sessionSummaryCache.get(id);
+      }
+
+      const promise = (async () => {
+        try {
+          const response = await fetch('/api/sessions/' + id, {
+            headers: { Accept: 'application/octet-stream' }
+          });
+          if (!response.ok) {
+            return null;
+          }
+          const compressed = new Uint8Array(await response.arrayBuffer());
+          const decompressed = decompress(compressed);
+          const text = new TextDecoder().decode(decompressed);
+          const payload = JSON.parse(text);
+          const session = payload?.session;
+          if (!session || typeof session !== 'object') {
+            return null;
+          }
+          return {
+            model: primaryModelFromTurns(session.turns),
+            agent: normalizeAgentName(session.source),
+          };
+        } catch {
+          return null;
+        }
+      })();
+
+      sessionSummaryCache.set(id, promise);
+      return promise;
+    }
+
+    async function enrichCardFromSession(item, techEl) {
+      if (!item || !item.id || (item.session_model && item.session_agent)) {
+        return;
+      }
+      const summary = await fetchSessionSummary(item.id);
+      if (!summary) {
+        return;
+      }
+      if (!item.session_model && summary.model) {
+        item.session_model = summary.model;
+      }
+      if (!item.session_agent && summary.agent) {
+        item.session_agent = summary.agent;
+      }
+      techEl.textContent =
+        'Agent: ' + (item.session_agent || 'unknown') + ' · Model: ' + (item.session_model || 'unknown');
     }
 
     function renderEmpty() {
@@ -980,9 +1105,19 @@ function generateHomeHtml(): string {
         meta.className = 'upload-meta';
         meta.textContent = makeMeta(item);
 
+        const model = document.createElement('p');
+        model.className = 'upload-model';
+        model.textContent =
+          'Agent: ' + (item.session_agent || 'unknown') + ' · Model: ' + (item.session_model || 'unknown');
+
         card.appendChild(title);
+        card.appendChild(model);
         card.appendChild(meta);
         uploadsEl.appendChild(card);
+
+        if (!item.session_model || !item.session_agent) {
+          void enrichCardFromSession(item, model);
+        }
       });
     }
 
@@ -1556,6 +1691,18 @@ function generateViewerHtml(sessionId: string): string {
       font-family: 'IBM Plex Mono', monospace;
     }
 
+    .turn-meta-footer {
+      padding: 7px 12px;
+      border-top: 1px solid var(--line);
+      background: #f7fbf8;
+      color: #436158;
+      font-size: 11px;
+      font-family: 'IBM Plex Mono', monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
     .loading,
     .error {
       display: flex;
@@ -1921,6 +2068,9 @@ function generateViewerHtml(sessionId: string): string {
             <div class="content">
               \${renderTabContent(turn)}
             </div>
+            <div class="turn-meta-footer">
+              \${renderTurnMeta(turn)}
+            </div>
             <div class="help-bar">
               \\u2191/\\u2193: Navigate | \\u2190/\\u2192: Tabs | j/k: Scroll/Tools | Enter: Open subagent | Esc: Back
             </div>
@@ -1970,6 +2120,35 @@ function generateViewerHtml(sessionId: string): string {
         default:
           return '';
       }
+    }
+
+    function currentSessionAgentName() {
+      if (!session || !session.source || typeof session.source !== 'object') {
+        return '-';
+      }
+      if (session.source.ClaudeCode) {
+        return 'Claude Code';
+      }
+      const otherName = session.source.Other && typeof session.source.Other.name === 'string'
+        ? session.source.Other.name.trim()
+        : '';
+      if (!otherName) {
+        return '-';
+      }
+      if (otherName.toLowerCase().includes('codex')) {
+        return 'Codex';
+      }
+      return otherName;
+    }
+
+    function renderTurnMeta(turn) {
+      if (!turn) {
+        return 'Agent: - · Model: - · Thinking effort: -';
+      }
+      const agent = currentSessionAgentName();
+      const model = turn.model ? escapeHtml(turn.model) : '-';
+      const effort = turn.thinking_effort ? escapeHtml(turn.thinking_effort) : '-';
+      return 'Agent: ' + escapeHtml(agent) + ' · Model: ' + model + ' · Thinking effort: ' + effort;
     }
 
     function renderPromptTab(turn) {
