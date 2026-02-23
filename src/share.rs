@@ -1242,19 +1242,22 @@ fn sanitize_filename(name: &str) -> String {
 
 /// Upload a cloud share payload to the configured share service.
 /// Returns the upload response with ID and URL.
-pub fn upload_session(
-    payload: &[u8],
-    api_url: &str,
-    auth_token: &str,
-    fingerprint: &str,
-    session_name: &str,
-    turn_count: usize,
-    session_model: Option<&str>,
-    session_agent: Option<&str>,
-    security: &str,
-) -> Result<UploadResponse> {
+pub struct UploadSessionRequest<'a> {
+    pub payload: &'a [u8],
+    pub api_url: &'a str,
+    pub auth_token: &'a str,
+    pub fingerprint: &'a str,
+    pub session_name: &'a str,
+    pub turn_count: usize,
+    pub session_model: Option<&'a str>,
+    pub session_agent: Option<&'a str>,
+    pub security: &'a str,
+}
+
+pub fn upload_session(request: UploadSessionRequest<'_>) -> Result<UploadResponse> {
     let client = reqwest::blocking::Client::new();
-    let safe_session_name: String = session_name
+    let safe_session_name: String = request
+        .session_name
         .chars()
         .map(|ch| {
             if ch.is_ascii() && ch != '\n' && ch != '\r' {
@@ -1264,7 +1267,7 @@ pub fn upload_session(
             }
         })
         .collect();
-    let safe_session_model = session_model.map(|model| {
+    let safe_session_model = request.session_model.map(|model| {
         model
             .chars()
             .map(|ch| {
@@ -1276,7 +1279,7 @@ pub fn upload_session(
             })
             .collect::<String>()
     });
-    let safe_session_agent = session_agent.map(|agent| {
+    let safe_session_agent = request.session_agent.map(|agent| {
         agent
             .chars()
             .map(|ch| {
@@ -1289,23 +1292,23 @@ pub fn upload_session(
             .collect::<String>()
     });
 
-    let mut request = client
-        .post(api_url)
+    let mut req = client
+        .post(request.api_url)
         .header("Content-Type", "application/octet-stream")
-        .bearer_auth(auth_token)
-        .header("X-Session-Fingerprint", fingerprint)
+        .bearer_auth(request.auth_token)
+        .header("X-Session-Fingerprint", request.fingerprint)
         .header("X-Session-Name", safe_session_name)
-        .header("X-Session-Turn-Count", turn_count.to_string())
-        .header("X-Share-Security", security);
+        .header("X-Session-Turn-Count", request.turn_count.to_string())
+        .header("X-Share-Security", request.security);
 
     if let Some(model) = safe_session_model {
-        request = request.header("X-Session-Model", model);
+        req = req.header("X-Session-Model", model);
     }
     if let Some(agent) = safe_session_agent {
-        request = request.header("X-Session-Agent", agent);
+        req = req.header("X-Session-Agent", agent);
     }
 
-    let response = request.body(payload.to_vec()).send()?;
+    let response = req.body(request.payload.to_vec()).send()?;
 
     if !response.status().is_success() {
         let status = response.status();

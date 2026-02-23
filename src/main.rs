@@ -2778,17 +2778,17 @@ fn run_cloud_upload_job(
     let _ = tx.send(UploadWorkerMessage::Progress(
         UploadWorkerProgress::Uploading(ShareTarget::Cloud),
     ));
-    let response = share::upload_session(
-        &payload,
-        &pending.api_url,
-        &pending.auth_token,
-        &fingerprint,
-        &pending.session.name,
-        pending.session.turns.len(),
-        session_model.as_deref(),
-        session_agent.as_deref(),
+    let response = share::upload_session(share::UploadSessionRequest {
+        payload: &payload,
+        api_url: &pending.api_url,
+        auth_token: &pending.auth_token,
+        fingerprint: &fingerprint,
+        session_name: &pending.session.name,
+        turn_count: pending.session.turns.len(),
+        session_model: session_model.as_deref(),
+        session_agent: session_agent.as_deref(),
         security,
-    )
+    })
     .map_err(|e| format!("Upload failed: {e}"))?;
 
     let base_url = share::normalize_share_url(&response.url);
