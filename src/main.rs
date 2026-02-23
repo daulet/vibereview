@@ -54,6 +54,7 @@ enum CliCommand {
     Login,
     Uploads,
     Help,
+    Version,
 }
 
 // =============================================================================
@@ -3750,7 +3751,7 @@ fn render_diff_tab(turn: &Turn) -> Text<'static> {
 
 fn usage_text(bin: &str) -> String {
     format!(
-        "Usage:\n  {bin}\n  {bin} import <shared-session.json.zst | share-url>\n  {bin} login\n  {bin} uploads\n  {bin} --help"
+        "Usage:\n  {bin}\n  {bin} import <shared-session.json.zst | share-url>\n  {bin} login\n  {bin} uploads\n  {bin} --help\n  {bin} --version"
     )
 }
 
@@ -3759,11 +3760,20 @@ fn parse_cli_command(args: &[String]) -> Result<CliCommand> {
     match args {
         [_] => Ok(CliCommand::Browse),
         [_, flag] if flag == "-h" || flag == "--help" => Ok(CliCommand::Help),
+        [_, flag] if flag == "-V" || flag == "--version" => Ok(CliCommand::Version),
         [_, cmd, path] if cmd == "import" => Ok(CliCommand::Import(PathBuf::from(path))),
         [_, cmd] if cmd == "login" => Ok(CliCommand::Login),
         [_, cmd] if cmd == "uploads" => Ok(CliCommand::Uploads),
         _ => Err(eyre!("Invalid arguments.\n\n{}", usage_text(bin))),
     }
+}
+
+fn version_text() -> String {
+    format!(
+        "{} {}",
+        env!("CARGO_PKG_NAME"),
+        env!("VIBEREVIEW_VERSION_STRING")
+    )
 }
 
 fn load_imported_session(path: &Path) -> Result<Session> {
@@ -3876,12 +3886,20 @@ fn main() -> Result<()> {
             run_uploads_command()?;
             return Ok(());
         }
+        CliCommand::Version => {
+            println!("{}", version_text());
+            return Ok(());
+        }
         CliCommand::Browse | CliCommand::Import(_) => {}
     }
 
     let imported_session = match command {
         CliCommand::Import(path) => Some(load_imported_session(&path)?),
-        CliCommand::Browse | CliCommand::Help | CliCommand::Login | CliCommand::Uploads => None,
+        CliCommand::Browse
+        | CliCommand::Help
+        | CliCommand::Login
+        | CliCommand::Uploads
+        | CliCommand::Version => None,
     };
 
     enable_raw_mode()?;
@@ -4444,6 +4462,20 @@ mod tests {
         let args = vec!["vibereview".to_string(), "uploads".to_string()];
         let parsed = parse_cli_command(&args).unwrap();
         assert!(matches!(parsed, CliCommand::Uploads));
+    }
+
+    #[test]
+    fn test_parse_cli_command_version() {
+        let args = vec!["vibereview".to_string(), "--version".to_string()];
+        let parsed = parse_cli_command(&args).unwrap();
+        assert!(matches!(parsed, CliCommand::Version));
+    }
+
+    #[test]
+    fn test_parse_cli_command_version_short() {
+        let args = vec!["vibereview".to_string(), "-V".to_string()];
+        let parsed = parse_cli_command(&args).unwrap();
+        assert!(matches!(parsed, CliCommand::Version));
     }
 
     #[test]
