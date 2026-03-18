@@ -5,10 +5,11 @@ mod models;
 mod share;
 
 use std::fmt::Write as _;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use color_eyre::{eyre::eyre, Result};
 use crossterm::{
@@ -29,8 +30,8 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use claude::{list_projects, list_sessions, parse_session};
-use codex::{list_codex_projects, list_codex_sessions_for_project, parse_codex_session};
+use claude::{list_projects, list_sessions, parse_session, quick_session_info};
+use codex::{parse_codex_session, quick_codex_session_info};
 use models::{Session, SessionSource, ToolInvocation, ToolType, Turn};
 
 // =============================================================================
@@ -46,6 +47,8 @@ const SEARCH_CURRENT_FG: Color = Color::Black;
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1500);
 const UPLOAD_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(40);
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+const INITIAL_SESSION_PAGE_SIZE: usize = 80;
+const INITIAL_SESSION_SCAN_MULTIPLIER: usize = 8;
 
 #[derive(Debug, Clone)]
 enum CliCommand {
@@ -268,6 +271,11 @@ enum UploadWorkerMessage {
     },
 }
 
+#[derive(Debug)]
+enum SessionIndexWorkerMessage {
+    Loaded { sessions: Vec<UnifiedSession> },
+}
+
 #[derive(Debug, Clone)]
 pub enum ResumeState {
     Idle,
@@ -378,6 +386,22 @@ impl UnifiedSession {
         }
     }
 
+    #[must_use]
+    pub fn identity_key(&self) -> String {
+        let source = match self.source {
+            Source::Claude => "claude",
+            Source::Codex => "codex",
+        };
+        if let Some(slug) = &self.slug {
+            return format!("{source}|{}|slug:{slug}", self.project_path.display());
+        }
+        format!(
+            "{source}|{}|resume:{}",
+            self.project_path.display(),
+            self.resume_session_id()
+        )
+    }
+
     /// Parse all session files and combine turns into a single Session.
     /// For grouped sessions (multiple paths), turns from all parts are combined chronologically.
     pub fn parse(&self) -> Result<Session, String> {
@@ -438,9 +462,168 @@ struct SessionPart {
     name: String,
     project: String,
     project_path: PathBuf,
-    modified: Option<std::time::SystemTime>,
+    modified: Option<SystemTime>,
     description: Option<String>,
     slug: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionFileCandidate {
+    source: Source,
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    claude_project_name: Option<String>,
+    claude_project_path: Option<PathBuf>,
+}
+
+fn is_codex_session_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl"))
+}
+
+fn collect_codex_session_file_candidates_recursive(
+    dir: &Path,
+    out: &mut Vec<SessionFileCandidate>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_codex_session_file_candidates_recursive(&path, out);
+            continue;
+        }
+        if !path.is_file() || !is_codex_session_file(&path) {
+            continue;
+        }
+        let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+        out.push(SessionFileCandidate {
+            source: Source::Codex,
+            path,
+            modified,
+            claude_project_name: None,
+            claude_project_path: None,
+        });
+    }
+}
+
+fn collect_initial_session_file_candidates() -> Vec<SessionFileCandidate> {
+    let mut candidates: Vec<SessionFileCandidate> = Vec::new();
+
+    for claude_project in list_projects() {
+        let project_path = PathBuf::from(&claude_project.decoded_path);
+        let project_name = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let Ok(entries) = fs::read_dir(&claude_project.path) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || !path.extension().is_some_and(|e| e == "jsonl") {
+                continue;
+            }
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with("agent-") {
+                continue;
+            }
+            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            candidates.push(SessionFileCandidate {
+                source: Source::Claude,
+                path,
+                modified,
+                claude_project_name: Some(project_name.clone()),
+                claude_project_path: Some(project_path.clone()),
+            });
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let codex_sessions_dir = home.join(".codex/sessions");
+        if codex_sessions_dir.exists() {
+            collect_codex_session_file_candidates_recursive(&codex_sessions_dir, &mut candidates);
+        }
+    }
+
+    candidates
+}
+
+/// Fast startup list:
+/// - Collect file metadata for all candidate session files.
+/// - Parse only enough recent files to fill the first page.
+fn list_initial_sessions(limit: usize) -> Vec<UnifiedSession> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = collect_initial_session_file_candidates();
+    candidates.sort_by(|a, b| b.modified.cmp(&a.modified));
+
+    let inspect_budget = limit
+        .saturating_mul(INITIAL_SESSION_SCAN_MULTIPLIER)
+        .max(limit);
+
+    let mut parts: Vec<SessionPart> = Vec::new();
+
+    for candidate in candidates.into_iter().take(inspect_budget) {
+        match candidate.source {
+            Source::Claude => {
+                let Some(info) = quick_session_info(&candidate.path) else {
+                    continue;
+                };
+                let Some(project) = candidate.claude_project_name.clone() else {
+                    continue;
+                };
+                let Some(project_path) = candidate.claude_project_path.clone() else {
+                    continue;
+                };
+
+                parts.push(SessionPart {
+                    source: Source::Claude,
+                    path: info.path,
+                    name: info.name,
+                    project,
+                    project_path,
+                    modified: info.modified,
+                    description: info.description,
+                    slug: info.slug,
+                });
+            }
+            Source::Codex => {
+                let Some(info) = quick_codex_session_info(&candidate.path) else {
+                    continue;
+                };
+                let Some(project_path) = info.project_path.clone() else {
+                    continue;
+                };
+                let project = project_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                parts.push(SessionPart {
+                    source: Source::Codex,
+                    path: info.path,
+                    name: info.name,
+                    project,
+                    project_path,
+                    modified: info.modified,
+                    description: info.description,
+                    slug: None,
+                });
+            }
+        }
+    }
+
+    let mut sessions = group_session_parts(parts);
+    sessions.truncate(limit);
+    sessions
 }
 
 /// List ALL sessions from both Claude and Codex across all projects, sorted by recency.
@@ -471,20 +654,27 @@ fn list_all_sessions() -> Vec<UnifiedSession> {
         }
     }
 
-    // Collect Codex sessions from all projects
-    for codex_project in list_codex_projects() {
-        for session in list_codex_sessions_for_project(&codex_project.path) {
-            parts.push(SessionPart {
-                source: Source::Codex,
-                path: session.path,
-                name: session.name,
-                project: codex_project.name.clone(),
-                project_path: codex_project.path.clone(),
-                modified: session.modified,
-                description: session.description,
-                slug: None, // Codex doesn't have slugs
-            });
-        }
+    // Collect Codex sessions in one pass (avoid rescanning the full tree per project)
+    for session in codex::list_codex_sessions() {
+        let Some(project_path) = session.project_path.clone() else {
+            continue;
+        };
+        let project = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        parts.push(SessionPart {
+            source: Source::Codex,
+            path: session.path,
+            name: session.name,
+            project,
+            project_path,
+            modified: session.modified,
+            description: session.description,
+            slug: None, // Codex doesn't have slugs
+        });
     }
 
     group_session_parts(parts)
@@ -763,6 +953,8 @@ pub struct App {
     pub search: Option<SearchState>,
     upload_worker_rx: Option<Receiver<UploadWorkerMessage>>,
     pending_cloud_upload: Option<PendingCloudUpload>,
+    session_index_worker_rx: Option<Receiver<SessionIndexWorkerMessage>>,
+    session_index_loading: bool,
 }
 
 impl Default for App {
@@ -774,13 +966,13 @@ impl Default for App {
 impl App {
     #[must_use]
     pub fn new() -> Self {
-        let sessions = list_all_sessions();
+        let sessions = list_initial_sessions(INITIAL_SESSION_PAGE_SIZE);
         let mut session_list_state = ListState::default();
         if !sessions.is_empty() {
             session_list_state.select(Some(0));
         }
 
-        Self {
+        let mut app = Self {
             view: View::SessionBrowser,
             sessions,
             session_list_state,
@@ -800,7 +992,11 @@ impl App {
             search: None,
             upload_worker_rx: None,
             pending_cloud_upload: None,
-        }
+            session_index_worker_rx: None,
+            session_index_loading: true,
+        };
+        app.spawn_session_index_worker();
+        app
     }
 
     #[must_use]
@@ -848,7 +1044,7 @@ impl App {
             .as_ref()
             .map(|f| f.timestamp + COPY_FEEDBACK_DURATION);
 
-        if self.upload_worker_rx.is_none() {
+        if self.upload_worker_rx.is_none() && self.session_index_worker_rx.is_none() {
             return copy_deadline;
         }
 
@@ -872,7 +1068,86 @@ impl App {
         if self.process_upload_worker_message() {
             changed = true;
         }
+        if self.process_session_index_worker_message() {
+            changed = true;
+        }
         changed
+    }
+
+    fn spawn_session_index_worker(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.session_index_worker_rx = Some(rx);
+        std::thread::spawn(move || {
+            let sessions = list_all_sessions();
+            let _ = tx.send(SessionIndexWorkerMessage::Loaded { sessions });
+        });
+    }
+
+    fn process_session_index_worker_message(&mut self) -> bool {
+        let recv_result = match self.session_index_worker_rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return false,
+        };
+
+        match recv_result {
+            Ok(msg) => {
+                self.handle_session_index_worker_message(msg);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.session_index_worker_rx = None;
+                self.session_index_loading = false;
+                false
+            }
+        }
+    }
+
+    fn find_session_index_by_key(&self, key: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.identity_key() == key)
+    }
+
+    fn handle_session_index_worker_message(&mut self, msg: SessionIndexWorkerMessage) {
+        match msg {
+            SessionIndexWorkerMessage::Loaded { sessions } => {
+                let selected_key = self
+                    .session_list_state
+                    .selected()
+                    .and_then(|i| self.sessions.get(i))
+                    .map(UnifiedSession::identity_key);
+                let current_key = self
+                    .current_session_index
+                    .and_then(|i| self.sessions.get(i))
+                    .map(UnifiedSession::identity_key);
+
+                self.sessions = sessions;
+                self.session_index_worker_rx = None;
+                self.session_index_loading = false;
+
+                self.current_session_index = current_key
+                    .as_deref()
+                    .and_then(|key| self.find_session_index_by_key(key));
+
+                let selected_index = selected_key
+                    .as_deref()
+                    .and_then(|key| self.find_session_index_by_key(key))
+                    .or_else(|| (!self.sessions.is_empty()).then_some(0));
+                self.session_list_state.select(selected_index);
+
+                if matches!(
+                    self.search.as_ref().map(|s| s.scope),
+                    Some(SearchScope::SessionList)
+                ) {
+                    let lines = self.search_lines_for_scope(SearchScope::SessionList);
+                    if let Some(search) = self.search.as_mut() {
+                        search.lines = lines;
+                        Self::update_search_hits(search);
+                    }
+                }
+            }
+        }
     }
 
     fn process_upload_worker_message(&mut self) -> bool {
@@ -2532,7 +2807,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         .selected()
         .and_then(|i| app.sessions.get(i))
         .is_some();
-    let title = browser_title(app.sessions.len(), can_resume);
+    let title = browser_title(app.sessions.len(), can_resume, app.session_index_loading);
 
     // Render header line and list
     let chunks = Layout::default()
@@ -2607,7 +2882,7 @@ fn render_session_browser(frame: &mut Frame, app: &mut App) {
         (status, Style::default().fg(Color::Yellow))
     } else {
         (
-            browser_help_text(can_resume),
+            browser_help_text(can_resume, app.session_index_loading),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -2636,15 +2911,27 @@ fn format_time_ago(modified: Option<std::time::SystemTime>) -> String {
         .unwrap_or_default()
 }
 
-fn browser_title(session_count: usize, can_resume: bool) -> String {
+fn browser_title(session_count: usize, can_resume: bool, loading_more: bool) -> String {
     let resume = if can_resume { " | R: resume" } else { "" };
-    format!(" Sessions ({session_count}) - Enter: open{resume} | m: metadata | u: share | q: quit ")
+    let loading = if loading_more {
+        " | loading more..."
+    } else {
+        ""
+    };
+    format!(
+        " Sessions ({session_count}) - Enter: open{resume} | m: metadata | u: share{loading} | q: quit "
+    )
 }
 
-fn browser_help_text(can_resume: bool) -> String {
+fn browser_help_text(can_resume: bool, loading_more: bool) -> String {
     let resume = if can_resume { " | R: Resume" } else { "" };
+    let loading = if loading_more {
+        " | Background indexing in progress"
+    } else {
+        ""
+    };
     format!(
-        " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search{resume} | m: Metadata | u: Share | q: Quit "
+        " ↑/↓: Navigate | PageUp/PageDown: Fast | Enter: Open | /: Search{resume} | m: Metadata | u: Share | q: Quit{loading} "
     )
 }
 
@@ -4507,8 +4794,8 @@ mod tests {
 
     #[test]
     fn test_browser_help_text_hides_resume_when_unavailable() {
-        assert!(!browser_help_text(false).contains("R: Resume"));
-        assert!(browser_help_text(true).contains("R: Resume"));
+        assert!(!browser_help_text(false, false).contains("R: Resume"));
+        assert!(browser_help_text(true, false).contains("R: Resume"));
     }
 
     #[test]
@@ -4521,7 +4808,7 @@ mod tests {
 
     #[test]
     fn test_help_text_mentions_metadata_shortcut() {
-        assert!(browser_help_text(false).contains("m: Metadata"));
+        assert!(browser_help_text(false, false).contains("m: Metadata"));
         assert!(viewer_help_text(false, false).contains("m: Metadata"));
         assert!(viewer_help_text(true, false).contains("m: Metadata"));
     }

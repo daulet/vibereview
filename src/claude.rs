@@ -93,6 +93,33 @@ pub fn list_sessions(project_path: &Path) -> Vec<SessionInfo> {
     sessions
 }
 
+/// Probe a single Claude session file quickly.
+///
+/// Returns `None` for non-session files or sessions without assistant replies.
+pub fn quick_session_info(path: &Path) -> Option<SessionInfo> {
+    if !path.extension().is_some_and(|e| e == "jsonl") {
+        return None;
+    }
+
+    let name = path.file_stem()?.to_string_lossy().to_string();
+    if name.starts_with("agent-") {
+        return None;
+    }
+    if !session_has_messages(path) {
+        return None;
+    }
+
+    let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+    let (description, slug) = extract_session_metadata(path);
+    Some(SessionInfo {
+        name,
+        path: path.to_path_buf(),
+        modified,
+        description,
+        slug,
+    })
+}
+
 /// Extract session metadata: description and slug.
 fn extract_session_metadata(path: &Path) -> (Option<String>, Option<String>) {
     let Ok(file) = File::open(path) else {

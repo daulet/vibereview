@@ -11,13 +11,6 @@ use serde_json::Value;
 
 use crate::models::{Session, SessionSource, ToolInvocation, ToolType, Turn};
 
-/// Information about a Codex project (derived from session cwd).
-#[derive(Debug, Clone)]
-pub struct CodexProjectInfo {
-    pub path: PathBuf,
-    pub name: String,
-}
-
 /// Information about a Codex session file.
 #[derive(Debug, Clone)]
 pub struct CodexSessionInfo {
@@ -85,6 +78,33 @@ fn collect_sessions_recursive(dir: &Path, sessions: &mut Vec<CodexSessionInfo>) 
             }
         }
     }
+}
+
+/// Probe a single Codex session file quickly.
+///
+/// Returns `None` for non-session files or files without assistant/agent replies.
+pub fn quick_codex_session_info(path: &Path) -> Option<CodexSessionInfo> {
+    let name = path.file_name()?.to_str()?.to_string();
+    let is_json = std::path::Path::new(&name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl"));
+    if !is_json {
+        return None;
+    }
+    if !codex_session_has_messages(path) {
+        return None;
+    }
+
+    let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+    let project_path = extract_session_project_path(path);
+    let description = extract_codex_session_description(path);
+    Some(CodexSessionInfo {
+        path: path.to_path_buf(),
+        name,
+        modified,
+        project_path,
+        description,
+    })
 }
 
 /// Extract description from first user message in Codex session.
@@ -176,47 +196,6 @@ fn extract_session_project_path(path: &Path) -> Option<PathBuf> {
     }
     // Old JSON format doesn't have cwd
     None
-}
-
-/// List Codex projects (unique cwd paths from sessions).
-pub fn list_codex_projects() -> Vec<CodexProjectInfo> {
-    let sessions = list_codex_sessions();
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-    for session in &sessions {
-        if let Some(proj_path) = &session.project_path {
-            seen.insert(proj_path.clone());
-        }
-    }
-
-    let mut projects: Vec<CodexProjectInfo> = seen
-        .into_iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            CodexProjectInfo { path, name }
-        })
-        .collect();
-
-    // Sort by name
-    projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    projects
-}
-
-/// List Codex sessions for a specific project path.
-pub fn list_codex_sessions_for_project(project_path: &Path) -> Vec<CodexSessionInfo> {
-    let sessions = list_codex_sessions();
-    let mut filtered: Vec<CodexSessionInfo> = sessions
-        .into_iter()
-        .filter(|s| s.project_path.as_deref() == Some(project_path))
-        .collect();
-
-    // Sort by modification time, newest first
-    filtered.sort_by(|a, b| b.modified.cmp(&a.modified));
-    filtered
 }
 
 /// Parse a Codex session file (supports both JSON and JSONL formats).
